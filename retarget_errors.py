@@ -6,10 +6,11 @@ from __future__ import annotations
 class RetargetError(RuntimeError):
     """Runtime error carrying a stable machine-readable code."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, diagnostics: dict | None = None) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.diagnostics = diagnostics or {}
 
 
 MISSING_BVH = "MISSING_BVH"
@@ -17,6 +18,7 @@ UNPARSEABLE_BVH = "UNPARSEABLE_BVH"
 UNPARSEABLE_RIG = "UNPARSEABLE_RIG"
 RIG_HAS_NO_SKIN_OR_SKELETON = "RIG_HAS_NO_SKIN_OR_SKELETON"
 MAPPING_INCOMPATIBLE = "MAPPING_INCOMPATIBLE"
+CALIBRATION_UNAVAILABLE = "CALIBRATION_UNAVAILABLE"
 EXPORT_FAILED = "EXPORT_FAILED"
 RETARGET_UNAVAILABLE = "RETARGET_UNAVAILABLE"
 

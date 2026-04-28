@@ -122,6 +122,47 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         self.assertEqual(document["animations"][-1]["channels"][0]["target"]["path"], "translation")
         self.assertTrue(validation_report["passed"], validation_report)
 
+    def test_generate_animate_rigged_mesh_reports_humanoid_contract_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = Path(tmp) / "outputs"
+            rig = Path(tmp) / "contract_avatar.gltf"
+            self._write_contract_rig_and_sidecar(rig)
+            instance = KimodoGenerator(Path(tmp) / "model", outputs)
+            instance._loaded = True
+
+            with self._patched_runtime(run_side_effect=self._write_full_contract_motion_bundle):
+                animated = instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(rig), "source_kind": "unirig_recommended"})
+
+            metadata = json.loads((animated.parent / "metadata.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["humanoid_contract"]["schema"], "modly.humanoid.v1")
+        self.assertEqual(Path(metadata["humanoid_contract"]["path"]).name, "contract_avatar.rigmeta.json")
+        self.assertIn("humanoid_contract_calibrated_mapping", metadata["warnings"])
+        self.assertEqual(metadata["mapping_confidence"], "calibrated")
+        self.assertEqual(metadata["retarget_calibration"]["chain_coverage"]["torso"], "5/5")
+        self.assertEqual(metadata["diagnostics"]["humanoid_contract"]["diagnostics"], ["humanoid_contract_validated"])
+
+    def test_generate_animate_rigged_mesh_reports_humanoid_contract_failure_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = Path(tmp) / "outputs"
+            rig = Path(tmp) / "contract_avatar.gltf"
+            self._write_contract_rig_and_sidecar(rig, schema="wrong.schema")
+            instance = KimodoGenerator(Path(tmp) / "model", outputs)
+            instance._loaded = True
+
+            with self._patched_runtime(run_side_effect=self._write_motion_bundle):
+                with self.assertRaises(KimodoRuntimeError) as ctx:
+                    instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(rig)})
+
+            bundle = next(outputs.iterdir())
+            metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(ctx.exception.code, "MAPPING_INCOMPATIBLE")
+        self.assertEqual(metadata["retarget_status"], "failed")
+        self.assertIn("humanoid_contract", metadata["diagnostics"])
+        self.assertIn("humanoid_contract_schema_unsupported:wrong.schema", metadata["diagnostics"]["humanoid_contract"]["diagnostics"])
+
     def test_generate_animate_rigged_mesh_preserves_unknown_best_effort_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
             outputs = Path(tmp) / "outputs"
@@ -305,6 +346,109 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         (bundle_dir / "motion.bvh").write_text((FIXTURES / "synthetic_walk.bvh").read_text(encoding="utf-8"), encoding="utf-8")
         return {"output_stem_name": "motion", "num_samples": 1}
 
+    def _write_full_contract_motion_bundle(self, bundle_dir, request, checkpoint_root, progress_cb=None):
+        del request, checkpoint_root, progress_cb
+        (bundle_dir / "motion.npz").write_bytes(b"npz")
+        hierarchy = """HIERARCHY
+ROOT Hips
+{
+  OFFSET 0.0 0.0 0.0
+  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation
+  JOINT Spine
+  {
+    OFFSET 0.0 1.0 0.0
+    CHANNELS 3 Zrotation Xrotation Yrotation
+    JOINT Chest
+    {
+      OFFSET 0.0 1.0 0.0
+      CHANNELS 3 Zrotation Xrotation Yrotation
+      JOINT Neck
+      {
+        OFFSET 0.0 1.0 0.0
+        CHANNELS 3 Zrotation Xrotation Yrotation
+        JOINT Head
+        {
+          OFFSET 0.0 0.5 0.0
+          CHANNELS 3 Zrotation Xrotation Yrotation
+        }
+      }
+      JOINT LeftUpperArm
+      {
+        OFFSET -1.0 0.5 0.0
+        CHANNELS 3 Zrotation Xrotation Yrotation
+        JOINT LeftForeArm
+        {
+          OFFSET 0.0 1.0 0.0
+          CHANNELS 3 Zrotation Xrotation Yrotation
+          JOINT LeftHand
+          {
+            OFFSET 0.0 0.5 0.0
+            CHANNELS 3 Zrotation Xrotation Yrotation
+          }
+        }
+      }
+      JOINT RightUpperArm
+      {
+        OFFSET 1.0 0.5 0.0
+        CHANNELS 3 Zrotation Xrotation Yrotation
+        JOINT RightForeArm
+        {
+          OFFSET 0.0 1.0 0.0
+          CHANNELS 3 Zrotation Xrotation Yrotation
+          JOINT RightHand
+          {
+            OFFSET 0.0 0.5 0.0
+            CHANNELS 3 Zrotation Xrotation Yrotation
+          }
+        }
+      }
+    }
+  }
+  JOINT LeftUpperLeg
+  {
+    OFFSET -0.5 -1.0 0.0
+    CHANNELS 3 Zrotation Xrotation Yrotation
+    JOINT LeftLowerLeg
+    {
+      OFFSET 0.0 -1.0 0.0
+      CHANNELS 3 Zrotation Xrotation Yrotation
+      JOINT LeftFoot
+      {
+        OFFSET 0.0 -0.5 0.5
+        CHANNELS 3 Zrotation Xrotation Yrotation
+      }
+    }
+  }
+  JOINT RightUpperLeg
+  {
+    OFFSET 0.5 -1.0 0.0
+    CHANNELS 3 Zrotation Xrotation Yrotation
+    JOINT RightLowerLeg
+    {
+      OFFSET 0.0 -1.0 0.0
+      CHANNELS 3 Zrotation Xrotation Yrotation
+      JOINT RightFoot
+      {
+        OFFSET 0.0 -0.5 0.5
+        CHANNELS 3 Zrotation Xrotation Yrotation
+      }
+    }
+  }
+}
+MOTION
+Frames: 2
+Frame Time: 0.0333333
+"""
+        first_frame = [0.0] * 54
+        second_frame = [0.0] * 54
+        second_frame[0] = 1.0
+        second_frame[19] = 15.0
+        (bundle_dir / "motion.bvh").write_text(
+            hierarchy + " ".join(str(value) for value in first_frame) + "\n" + " ".join(str(value) for value in second_frame) + "\n",
+            encoding="utf-8",
+        )
+        return {"output_stem_name": "motion", "num_samples": 1}
+
     def _write_npz_only(self, bundle_dir, request, checkpoint_root, progress_cb=None):
         del request, checkpoint_root, progress_cb
         (bundle_dir / "motion.npz").write_bytes(b"npz")
@@ -321,6 +465,52 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         chunk_length, chunk_type = struct.unpack_from("<II", data, 12)
         self.assertEqual(chunk_type, 0x4E4F534A)
         return json.loads(data[20:20 + chunk_length].rstrip(b" \t\r\n\x00").decode("utf-8"))
+
+    def _write_contract_rig_and_sidecar(self, path, *, schema="modly.humanoid.v1"):
+        roles = [
+            "hips",
+            "spine",
+            "chest",
+            "neck",
+            "head",
+            "left_upper_arm",
+            "left_forearm",
+            "left_hand",
+            "right_upper_arm",
+            "right_forearm",
+            "right_hand",
+            "left_upper_leg",
+            "left_lower_leg",
+            "left_foot",
+            "right_upper_leg",
+            "right_lower_leg",
+            "right_foot",
+        ]
+        nodes = [{"name": f"contract_{role}"} for role in roles]
+        path.write_text(
+            json.dumps({
+                "asset": {"version": "2.0"},
+                "nodes": nodes,
+                "skins": [{"joints": list(range(len(roles))), "inverseBindMatrices": 0}],
+            }),
+            encoding="utf-8",
+        )
+        chains = {
+            "torso": ["hips", "spine", "chest", "neck", "head"],
+            "left_arm": ["left_upper_arm", "left_forearm", "left_hand"],
+            "right_arm": ["right_upper_arm", "right_forearm", "right_hand"],
+            "left_leg": ["left_upper_leg", "left_lower_leg", "left_foot"],
+            "right_leg": ["right_upper_leg", "right_lower_leg", "right_foot"],
+        }
+        sidecar = {
+            "humanoid_contract": {
+                "schema": schema,
+                "roles": {role: {"node_index": index, "node_name": f"contract_{role}"} for index, role in enumerate(roles)},
+                "chains": chains,
+                "basis_hints": {"up_axis": "Y"},
+            }
+        }
+        path.with_suffix(".rigmeta.json").write_text(json.dumps(sidecar), encoding="utf-8")
 
 
 if __name__ == "__main__":

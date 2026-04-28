@@ -26,7 +26,7 @@ TARGET_OUTPUT_TYPES = {
     "rotation": {"VEC4"},
     "weights": {"SCALAR"},
 }
-TYPE_ARITY = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+TYPE_ARITY = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
 LIMITATION = "Structural validation only: parseable non-zero animation data does not prove visual quality."
 
 
@@ -89,6 +89,8 @@ def validate_gltf_document(
         return report
 
     resolver = BufferResolver(document, bin_chunk=bin_chunk)
+    _validate_buffer_references(document, resolver, report, source_path=source_path, bin_chunk=bin_chunk)
+    _validate_skin_inverse_bind_matrices(document, resolver, report, source_path=source_path)
     _validate_animation(document, animation, resolver, report, epsilon=epsilon, source_path=source_path)
     report["passed"] = not report["errors"] if own_report else report.get("passed", False)
     return report
@@ -205,6 +207,16 @@ def _new_report(bundle_path: Path, animated_path: Path) -> dict[str, Any]:
             "changed_samples": 0,
             "target_paths": [],
             "skin_joint_targets": [],
+            "frame0_rest_pose": {"checked": 0, "matched": 0, "mismatches": []},
+        },
+        "retarget_calibration": {
+            "present": False,
+            "version": None,
+            "chain_coverage": {},
+            "basis_sources": {},
+            "composition_order": None,
+            "warnings_by_severity": {},
+            "numeric_checks_only": True,
         },
         "artifacts": {"expected": list(EXPECTED_ARTIFACTS), "present": [], "missing": []},
         "metadata": {},
@@ -259,6 +271,9 @@ def _validate_metadata(bundle: Path, report: dict[str, Any], *, animated_name: s
             if isinstance(artifact, str) and not (bundle / artifact).exists():
                 _error(report, "metadata_mismatch", f"metadata artifact does not exist: {artifact}.", str(bundle / artifact))
 
+    calibration = metadata.get("retarget_calibration")
+    calibration_report = _validate_calibration_metadata(calibration, report, path)
+
     return {
         "retarget_status": metadata.get("retarget_status"),
         "source_kind": source_kind,
@@ -267,7 +282,32 @@ def _validate_metadata(bundle: Path, report: dict[str, Any], *, animated_name: s
         "warnings": warnings if isinstance(warnings, list) else [],
         "source_rigged_mesh": source_path,
         "artifacts": artifacts if isinstance(artifacts, list) else [],
+        "retarget_calibration": calibration_report,
     }
+
+
+def _validate_calibration_metadata(calibration: Any, report: dict[str, Any], metadata_path: Path) -> dict[str, Any]:
+    if calibration in (None, {}):
+        return report["retarget_calibration"]
+    if not isinstance(calibration, dict):
+        _error(report, "metadata_mismatch", "retarget_calibration must be an object when present.", str(metadata_path))
+        return report["retarget_calibration"]
+    required = ("version", "sidecar_provenance", "chains", "chain_coverage", "basis_sources", "composition_order", "warnings_by_severity")
+    for field in required:
+        if field not in calibration:
+            _error(report, "metadata_mismatch", f"retarget_calibration missing {field}.", str(metadata_path))
+    chain_coverage = calibration.get("chain_coverage") if isinstance(calibration.get("chain_coverage"), dict) else {}
+    basis_sources = calibration.get("basis_sources") if isinstance(calibration.get("basis_sources"), dict) else {}
+    report["retarget_calibration"] = {
+        "present": True,
+        "version": calibration.get("version"),
+        "chain_coverage": chain_coverage,
+        "basis_sources": basis_sources,
+        "composition_order": calibration.get("composition_order"),
+        "warnings_by_severity": calibration.get("warnings_by_severity") if isinstance(calibration.get("warnings_by_severity"), dict) else {},
+        "numeric_checks_only": True,
+    }
+    return report["retarget_calibration"]
 
 
 def _load_glb(path: Path) -> tuple[dict[str, Any], bytes | None]:
@@ -316,6 +356,66 @@ def _validate_document_shape(document: dict[str, Any], report: dict[str, Any], s
     return ok
 
 
+def _validate_buffer_references(
+    document: dict[str, Any],
+    resolver: BufferResolver,
+    report: dict[str, Any],
+    *,
+    source_path: str | Path | None,
+    bin_chunk: bytes | None,
+) -> None:
+    buffers = document["buffers"]
+    buffer_views = document["bufferViews"]
+    if buffers and isinstance(buffers[0], dict) and buffers[0].get("uri") is None and bin_chunk is None:
+        _error(report, "missing_bin_chunk", "GLB buffer 0 uses BIN storage but the asset has no BIN chunk.", str(source_path or "<in-memory>"))
+
+    for index, buffer_view in enumerate(buffer_views):
+        if not isinstance(buffer_view, dict):
+            _error(report, "invalid_buffer_reference", f"bufferView {index} is not an object.", str(source_path or "<in-memory>"))
+            continue
+        buffer_index = buffer_view.get("buffer")
+        if not isinstance(buffer_index, int) or buffer_index < 0 or buffer_index >= len(buffers):
+            _error(report, "invalid_buffer_reference", f"bufferView {index} references invalid buffer.", str(source_path or "<in-memory>"))
+            continue
+        byte_offset = buffer_view.get("byteOffset", 0)
+        byte_length = buffer_view.get("byteLength")
+        if not isinstance(byte_offset, int) or byte_offset < 0 or not isinstance(byte_length, int) or byte_length < 0:
+            _error(report, "invalid_buffer_reference", f"bufferView {index} has invalid byte offset/length.", str(source_path or "<in-memory>"))
+            continue
+        try:
+            data = resolver.get(buffer_index)
+        except AccessorError as exc:
+            _error(report, "invalid_buffer_reference", f"bufferView {index}: {exc}", str(source_path or "<in-memory>"))
+            continue
+        if byte_offset + byte_length > len(data):
+            _error(report, "invalid_buffer_reference", f"bufferView {index} exceeds buffer {buffer_index} bounds.", str(source_path or "<in-memory>"))
+
+
+def _validate_skin_inverse_bind_matrices(
+    document: dict[str, Any],
+    resolver: BufferResolver,
+    report: dict[str, Any],
+    *,
+    source_path: str | Path | None,
+) -> None:
+    accessors = document["accessors"]
+    for skin_index, skin in enumerate(document.get("skins", [])):
+        if not isinstance(skin, dict) or "inverseBindMatrices" not in skin:
+            continue
+        accessor_index = skin.get("inverseBindMatrices")
+        if not isinstance(accessor_index, int) or accessor_index < 0 or accessor_index >= len(accessors):
+            _error(report, "invalid_skin_inverse_bind_matrices", f"skin {skin_index} references invalid inverseBindMatrices accessor.", str(source_path or "<in-memory>"))
+            continue
+        try:
+            matrices = decode_accessor(document, resolver, accessor_index, expected_types={"MAT4"})
+        except AccessorError as exc:
+            _error(report, "invalid_skin_inverse_bind_matrices", f"skin {skin_index} inverseBindMatrices: {exc}", str(source_path or "<in-memory>"))
+            continue
+        joints = skin.get("joints")
+        if isinstance(joints, list) and len(matrices) != len(joints):
+            _error(report, "invalid_skin_inverse_bind_matrices", f"skin {skin_index} inverseBindMatrices count does not match joints count.", str(source_path or "<in-memory>"))
+
+
 def _select_animation(animations: list[Any], report: dict[str, Any]) -> Any:
     for animation in animations:
         if isinstance(animation, dict) and animation.get("name") == "Kimodo Motion":
@@ -350,6 +450,7 @@ def _validate_animation(
     valid_channels = 0
     target_paths: list[str] = []
     skin_target_nodes: list[int] = []
+    frame0_rest_pose = {"checked": 0, "matched": 0, "mismatches": []}
 
     for channel_index, channel in enumerate(channels):
         if not isinstance(channel, dict):
@@ -393,6 +494,7 @@ def _validate_animation(
             continue
 
         base = outputs[0]
+        _record_frame0_rest_pose(document, node_index, target_path, base, frame0_rest_pose, epsilon=epsilon)
         channel_changed = sum(1 for sample in outputs[1:] if any(abs(value - base[i]) > epsilon for i, value in enumerate(sample)))
         changed_samples += channel_changed
         valid_channels += 1
@@ -407,6 +509,7 @@ def _validate_animation(
     report["animation"]["changed_samples"] = changed_samples
     report["animation"]["target_paths"] = sorted(set(target_paths))
     report["animation"]["skin_joint_targets"] = sorted(set(skin_target_nodes))
+    report["animation"]["frame0_rest_pose"] = frame0_rest_pose
     if valid_channels == 0:
         _error(report, "bad_animation_reference", "No valid animation channels could be decoded.", str(source_path or "<in-memory>"))
     elif changed_samples == 0:
@@ -421,6 +524,43 @@ def _skin_joints(document: dict[str, Any]) -> set[int] | None:
             determinable = True
             joints.update(joint for joint in skin["joints"] if isinstance(joint, int))
     return joints if determinable else None
+
+
+def _record_frame0_rest_pose(
+    document: dict[str, Any],
+    node_index: int,
+    target_path: str,
+    first_sample: tuple[float, ...],
+    report: dict[str, Any],
+    *,
+    epsilon: float,
+) -> None:
+    if target_path not in {"translation", "rotation"}:
+        return
+    node = document["nodes"][node_index]
+    if not isinstance(node, dict):
+        return
+    expected = _node_rest_value(node, target_path)
+    report["checked"] += 1
+    if len(first_sample) == len(expected) and all(abs(first_sample[index] - expected[index]) <= epsilon for index in range(len(expected))):
+        report["matched"] += 1
+        return
+    report["mismatches"].append({
+        "node": node_index,
+        "path": target_path,
+        "expected": list(expected),
+        "actual": list(first_sample),
+    })
+
+
+def _node_rest_value(node: dict[str, Any], target_path: str) -> tuple[float, ...]:
+    if target_path == "translation":
+        value = node.get("translation", (0.0, 0.0, 0.0))
+        return tuple(float(component) for component in value) if isinstance(value, (list, tuple)) and len(value) == 3 else (0.0, 0.0, 0.0)
+    if target_path == "rotation":
+        value = node.get("rotation", (0.0, 0.0, 0.0, 1.0))
+        return tuple(float(component) for component in value) if isinstance(value, (list, tuple)) and len(value) == 4 else (0.0, 0.0, 0.0, 1.0)
+    return ()
 
 
 def _decode_data_uri(uri: str) -> bytes:
