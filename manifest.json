@@ -4,7 +4,7 @@
   "type": "model",
   "version": "0.1.0",
   "source": "https://github.com/DrHepa/Kimodo-modly-extension",
-  "description": "Experimental Kimodo SOMA RP runtime shell for Modly. Uses text-to-motion generation, persists canonical motion artifacts, and returns a compatibility GLB preview for the current mesh-centric product surface.",
+  "description": "Kimodo SOMA RP human motion generation for Modly. Generates text-driven humanoid motion artifacts and returns a compatibility GLB preview.",
   "author": "DrHepa",
   "generator_class": "KimodoGenerator",
   "tags": [
@@ -27,6 +27,7 @@
     {
       "id": "text-to-motion-preview",
       "name": "Text to Motion Preview",
+      "type": "model",
       "input": "text",
       "output": "mesh",
       "description": "Generates a Kimodo motion bundle and returns a compatibility GLB preview for Modly.",
@@ -93,6 +94,110 @@
             }
           ],
           "tooltip": "Optional path to a Kimodo constraints JSON file."
+        },
+        {
+          "id": "export_bvh",
+          "label": "Export BVH",
+          "type": "boolean",
+          "default": false,
+          "tooltip": "Also export BVH alongside the canonical NPZ when available."
+        },
+        {
+          "id": "disable_postprocess",
+          "label": "Disable Postprocess",
+          "type": "boolean",
+          "default": true,
+          "tooltip": "Runtime-core defaults to no postprocess because MotionCorrection is intentionally skipped in setup."
+        },
+        {
+          "id": "text_encoder_device",
+          "label": "Text Encoder Device",
+          "type": "select",
+          "default": "cpu",
+          "options": [
+            {
+              "value": "cpu",
+              "label": "CPU"
+            },
+            {
+              "value": "auto",
+              "label": "Auto"
+            },
+            {
+              "value": "cuda",
+              "label": "CUDA"
+            }
+          ],
+          "tooltip": "TEXT_ENCODER_DEVICE override for Kimodo. CPU is the safest runtime-core baseline."
+        }
+      ]
+    },
+    {
+      "id": "animate-rigged-mesh",
+      "name": "Animate Rigged Mesh",
+      "type": "model",
+      "input": "text",
+      "inputs": [
+        {
+          "name": "prompt",
+          "type": "text",
+          "required": true
+        },
+        {
+          "name": "rigged_mesh",
+          "type": "mesh",
+          "required": true
+        }
+      ],
+      "output": "mesh",
+      "description": "Generates a Kimodo BVH/NPZ motion bundle and attempts a real root-translation MVP animated GLB export for a supplied rigged mesh. UniRig humanoid rigs are recommended; Load Mesh rigged GLB/GLTF inputs are accepted; non-humanoid rigs are best-effort.",
+      "hf_repo": "nvidia/Kimodo-SOMA-RP-v1",
+      "download_check": "config.yaml",
+      "weight_owner_id": "Kimodo-SOMA-RP-v1",
+      "params_schema": [
+        {
+          "id": "prompt",
+          "label": "Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Prompt text forwarded to Kimodo for motion generation."
+        },
+        {
+          "id": "duration",
+          "label": "Duration (s)",
+          "type": "float",
+          "default": 5.0,
+          "min": 0.1,
+          "max": 10.0,
+          "step": 0.1,
+          "tooltip": "Motion duration in seconds. Kimodo supports up to 10 seconds per prompt."
+        },
+        {
+          "id": "diffusion_steps",
+          "label": "Diffusion Steps",
+          "type": "int",
+          "default": 100,
+          "min": 1,
+          "max": 200,
+          "tooltip": "Number of Kimodo denoising steps. Higher values are slower."
+        },
+        {
+          "id": "num_samples",
+          "label": "Samples",
+          "type": "int",
+          "default": 1,
+          "min": 1,
+          "max": 4,
+          "tooltip": "Number of motion samples to generate. The first sample is used for the motion bundle."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 2147483647,
+          "tooltip": "Use -1 for an unseeded run. Non-negative values are forwarded to Kimodo for reproducibility."
         },
         {
           "id": "export_bvh",

@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from host_compat import EXPERIMENTAL, UNSUPPORTED, resolve_host_compatibility
+from glb_animation_exporter import GlbAnimationExporter
+from kimodo_bvh import locate_bvh, parse_bvh
+from retarget_errors import RetargetError
+from retarget_metadata import retarget_failure_metadata, retarget_success_metadata
+from retargeting import build_retarget_clip
+from rig_inspector import inspect_rig
 
 try:
     from services.generators.base import BaseGenerator
@@ -31,6 +37,9 @@ SETUP_SUMMARY_FILE = ".kimodo-runtime-core-setup.json"
 KIMODO_MODEL_NAME = "Kimodo-SOMA-RP-v1"
 KIMODO_DOWNLOAD_CHECK = "config.yaml"
 MOTION_BUNDLE_VERSION = "kimodo-runtime-core/v1"
+PREVIEW_NODE_ID = "text-to-motion-preview"
+ANIMATE_RIGGED_MESH_NODE_ID = "animate-rigged-mesh"
+ALLOWED_RIGGED_MESH_SUFFIXES = {".glb", ".gltf"}
 
 
 def read_setup_summary() -> dict[str, Any] | None:
@@ -259,6 +268,12 @@ class KimodoGenerator(BaseGenerator):
         metadata_path = bundle_dir / "metadata.json"
         write_bundle_metadata(metadata_path, bundle_dir, preview_path, first_npz, request)
 
+        if request["node_id"] == ANIMATE_RIGGED_MESH_NODE_ID:
+            animated_path = retarget_motion_bundle(bundle_dir, metadata_path, request, completed)
+            if progress_cb:
+                progress_cb(100, "Kimodo retarget/export complete")
+            return animated_path
+
         if progress_cb:
             progress_cb(100, "Kimodo runtime complete")
         return preview_path
@@ -305,9 +320,15 @@ def normalize_request(params: dict[str, Any]) -> dict[str, Any]:
     if text_encoder_device not in {"cpu", "auto", "cuda"}:
         raise KimodoRuntimeError("INVALID_INPUT", "text_encoder_device must be one of: cpu, auto, cuda.")
 
+    node_id = normalize_node_id(params)
     constraints_path = resolve_constraints_path(params.get("constraints_path", ""))
+    rigged_mesh_path = None
+    if node_id == ANIMATE_RIGGED_MESH_NODE_ID:
+        rigged_mesh_path = resolve_rigged_mesh_path(params.get("rigged_mesh_path", params.get("mesh_path", "")))
+        export_bvh = True
 
     return {
+        "node_id": node_id,
         "prompt": prompt.strip(),
         "duration": float(duration),
         "diffusion_steps": diffusion_steps,
@@ -317,7 +338,36 @@ def normalize_request(params: dict[str, Any]) -> dict[str, Any]:
         "export_bvh": export_bvh,
         "disable_postprocess": disable_postprocess,
         "text_encoder_device": text_encoder_device,
+        "rigged_mesh_path": rigged_mesh_path,
+        "rigged_mesh_source_kind": normalize_rigged_mesh_source_kind(params),
     }
+
+
+def normalize_rigged_mesh_source_kind(params: dict[str, Any]) -> str:
+    raw = params.get("rigged_mesh_source_kind", params.get("source_kind", "unknown_mesh_source"))
+    if not isinstance(raw, str):
+        return "unknown_mesh_source"
+    value = raw.strip()
+    if value in {"unirig_recommended", "load_mesh_existing", "unknown_mesh_source"}:
+        return value
+    return "unknown_mesh_source"
+
+
+def normalize_node_id(params: dict[str, Any]) -> str:
+    raw_node_id = params.get("node_id") or params.get("model_node_id") or params.get("capability_id")
+    if isinstance(raw_node_id, str) and raw_node_id.strip():
+        value = raw_node_id.strip()
+        if value.endswith(f"/{ANIMATE_RIGGED_MESH_NODE_ID}") or value == ANIMATE_RIGGED_MESH_NODE_ID:
+            return ANIMATE_RIGGED_MESH_NODE_ID
+        if value.endswith(f"/{PREVIEW_NODE_ID}") or value == PREVIEW_NODE_ID:
+            return PREVIEW_NODE_ID
+
+    raw_model_id = params.get("model_id")
+    if isinstance(raw_model_id, str) and raw_model_id.strip():
+        if raw_model_id.strip().endswith(f"/{ANIMATE_RIGGED_MESH_NODE_ID}"):
+            return ANIMATE_RIGGED_MESH_NODE_ID
+
+    return PREVIEW_NODE_ID
 
 
 def resolve_constraints_path(raw: Any) -> Path | None:
@@ -345,6 +395,41 @@ def resolve_constraints_path(raw: Any) -> Path | None:
     raise KimodoRuntimeError(
         "INVALID_INPUT",
         f"constraints_path could not be resolved to an existing file. Searched: {searched}",
+    )
+
+
+def resolve_rigged_mesh_path(raw: Any) -> Path:
+    if raw in (None, ""):
+        raise KimodoRuntimeError(
+            "INVALID_INPUT",
+            "rigged_mesh_path is required for Animate Rigged Mesh. Connect a rigged_mesh input or provide mesh_path as an alias.",
+        )
+    if not isinstance(raw, str):
+        raise KimodoRuntimeError("INVALID_INPUT", "rigged_mesh_path must be a string path when provided.")
+
+    candidate = Path(raw.strip()).expanduser()
+    if candidate.suffix.lower() not in ALLOWED_RIGGED_MESH_SUFFIXES:
+        allowed = ", ".join(sorted(ALLOWED_RIGGED_MESH_SUFFIXES))
+        raise KimodoRuntimeError("INVALID_INPUT", f"rigged_mesh_path must point to a supported mesh file: {allowed}.")
+
+    candidates = []
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        workspace_dir = os.environ.get("WORKSPACE_DIR")
+        if isinstance(workspace_dir, str) and workspace_dir.strip():
+            candidates.append(Path(workspace_dir.strip()) / candidate)
+        candidates.append(Path.cwd() / candidate)
+        candidates.append(EXT_DIR / candidate)
+
+    for resolved in candidates:
+        if resolved.is_file():
+            return resolved.resolve()
+
+    searched = ", ".join(str(path) for path in candidates)
+    raise KimodoRuntimeError(
+        "INVALID_INPUT",
+        f"rigged_mesh_path could not be resolved to an existing .glb/.gltf file. Searched: {searched}",
     )
 
 
@@ -467,6 +552,69 @@ def find_primary_npz(bundle_dir: Path, output_stem_name: str, num_samples: int) 
     )
 
 
+def retarget_motion_bundle(
+    bundle_dir: Path,
+    metadata_path: Path,
+    request: dict[str, Any],
+    completed: dict[str, Any],
+) -> Path:
+    """Retarget Kimodo BVH motion onto the supplied rig and export a real animated GLB."""
+
+    output_path = bundle_dir / "animated.glb"
+    diagnostics = {
+        "bundle_dir": str(bundle_dir),
+        "metadata_path": str(metadata_path),
+        "rigged_mesh_path": str(request["rigged_mesh_path"]),
+        "source_kind": request.get("rigged_mesh_source_kind", "unknown_mesh_source"),
+        "output_stem_name": completed.get("output_stem_name"),
+        "num_samples": completed.get("num_samples"),
+    }
+    try:
+        bvh_path = locate_bvh(bundle_dir, str(completed.get("output_stem_name") or "motion"))
+        diagnostics["bvh_path"] = str(bvh_path)
+        motion = parse_bvh(bvh_path)
+        rig = inspect_rig(
+            request["rigged_mesh_path"],
+            source_kind=str(request.get("rigged_mesh_source_kind") or "unknown_mesh_source"),
+        )
+        clip = build_retarget_clip(motion, rig)
+        diagnostics["mapping_confidence"] = clip.mapping.confidence
+        animated_path = GlbAnimationExporter().write_animation(rig, clip, output_path)
+        update_bundle_metadata(
+            metadata_path,
+            retarget_success_metadata(animated_path, rig=rig, clip=clip, warnings=clip.warnings, diagnostics=diagnostics),
+            bundle_dir=bundle_dir,
+        )
+        return animated_path
+    except RetargetError as exc:
+        update_bundle_metadata(
+            metadata_path,
+            retarget_failure_metadata(exc, diagnostics=diagnostics),
+            bundle_dir=bundle_dir,
+        )
+        raise KimodoRuntimeError(
+            exc.code,
+            f"Animate Rigged Mesh could not produce a real animated GLB: {exc.message}. Metadata was written to {metadata_path}.",
+        ) from exc
+
+
+def update_bundle_metadata(metadata_path: Path, updates: dict[str, Any], *, bundle_dir: Path | None = None) -> None:
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(updates)
+    if bundle_dir is not None:
+        payload["artifacts"] = [
+            str(artifact.relative_to(bundle_dir))
+            for artifact in sorted(bundle_dir.rglob("*"))
+            if artifact.is_file()
+        ]
+    metadata_path.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
+
+
 def build_preview_glb(npz_path: Path, preview_path: Path) -> None:
     try:
         import numpy as np
@@ -568,7 +716,13 @@ def write_bundle_metadata(
         "contract_version": MOTION_BUNDLE_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model": KIMODO_MODEL_NAME,
+        "node_id": request["node_id"],
         "prompt": request["prompt"],
+        "source_prompt": request["prompt"],
+        "source_rigged_mesh": str(request["rigged_mesh_path"]) if request["rigged_mesh_path"] else None,
+        "semantics": "animated_mesh_candidate" if request["node_id"] == ANIMATE_RIGGED_MESH_NODE_ID else "motion_preview",
+        "retarget_status": "requested" if request["node_id"] == ANIMATE_RIGGED_MESH_NODE_ID else "not_requested",
+        "rigged_mesh_source_kind": request.get("rigged_mesh_source_kind"),
         "duration": request["duration"],
         "diffusion_steps": request["diffusion_steps"],
         "num_samples": request["num_samples"],

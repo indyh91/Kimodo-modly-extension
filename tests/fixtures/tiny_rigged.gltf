@@ -1,0 +1,43 @@
+{
+  "asset": {"version": "2.0"},
+  "scene": 0,
+  "scenes": [{"nodes": [0]}],
+  "nodes": [
+    {"name": "Hips", "children": [1, 3, 4, 5, 6], "mesh": 0, "skin": 0},
+    {"name": "Spine", "children": [2]},
+    {"name": "Head"},
+    {"name": "LeftUpLeg"},
+    {"name": "RightUpLeg"},
+    {"name": "LeftArm"},
+    {"name": "RightArm"}
+  ],
+  "skins": [
+    {"joints": [0, 1, 2, 3, 4, 5, 6], "inverseBindMatrices": 0}
+  ],
+  "meshes": [
+    {
+      "name": "TinySkinnedTriangle",
+      "primitives": [
+        {"attributes": {"POSITION": 1, "JOINTS_0": 2, "WEIGHTS_0": 3}, "indices": 4, "material": 0}
+      ]
+    }
+  ],
+  "materials": [
+    {"name": "TinyMaterial", "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 1.0, 1.0]}}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 7, "type": "MAT4"},
+    {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+    {"bufferView": 2, "componentType": 5123, "count": 3, "type": "VEC4"},
+    {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC4"},
+    {"bufferView": 4, "componentType": 5123, "count": 3, "type": "SCALAR"}
+  ],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 448},
+    {"buffer": 0, "byteOffset": 448, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 484, "byteLength": 24},
+    {"buffer": 0, "byteOffset": 508, "byteLength": 48},
+    {"buffer": 0, "byteOffset": 556, "byteLength": 6}
+  ],
+  "buffers": [{"byteLength": 562, "uri": "data:application/octet-stream;base64,AAAAAAAAAAA="}]
+}
