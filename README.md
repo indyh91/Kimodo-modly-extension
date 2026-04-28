@@ -37,11 +37,7 @@ The important split is intentional:
 - `setup.py` installs the Python runtime and Kimodo package dependencies.
 - Modly's **Download** button owns model weights.
 
-Do not run setup from the source repository when validating Modly behavior. Stage/apply belongs under Modly's extensions directory, for example:
-
-```text
-/home/drhepa/Documentos/Modly/extensions/kimodo-soma-rp
-```
+Do not run setup from the source repository when validating Modly behavior. Install, repair, staging, and extension directory placement are owned by Modly's extension-management flow, not by this repository's source tree.
 
 ## Runtime Contract
 

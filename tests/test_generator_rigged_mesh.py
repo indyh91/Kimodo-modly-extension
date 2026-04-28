@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 import generator  # noqa: E402
 from generator import ANIMATE_RIGGED_MESH_NODE_ID, KimodoGenerator, KimodoRuntimeError, normalize_request  # noqa: E402
 from retarget_errors import RetargetError, legacy_error_aliases  # noqa: E402
+from validation.animated_glb_validator import validate_bundle  # noqa: E402
 
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -101,6 +102,7 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
 
             metadata = json.loads((animated.parent / "metadata.json").read_text(encoding="utf-8"))
             document = self._read_glb_document(animated)
+            validation_report = validate_bundle(animated.parent)
 
         self.assertEqual(metadata["retarget_status"], "success")
         self.assertEqual(metadata["source_rigged_mesh"], str(rig))
@@ -118,6 +120,7 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         )
         self.assertEqual(document["animations"][-1]["name"], "Kimodo Motion")
         self.assertEqual(document["animations"][-1]["channels"][0]["target"]["path"], "translation")
+        self.assertTrue(validation_report["passed"], validation_report)
 
     def test_generate_animate_rigged_mesh_preserves_unknown_best_effort_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
