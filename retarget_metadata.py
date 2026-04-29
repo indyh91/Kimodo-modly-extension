@@ -12,13 +12,18 @@ from retarget_errors import RetargetError, legacy_error_aliases
 def retarget_failure_metadata(error: RetargetError, *, diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
     merged_diagnostics = dict(diagnostics or {})
     merged_diagnostics.update(getattr(error, "diagnostics", {}) or {})
-    return {
+    payload = {
         "retarget_status": "failed",
         "retarget_error_code": error.code,
         "retarget_error_aliases": list(legacy_error_aliases(error.code)),
         "retarget_error_message": error.message,
         "diagnostics": merged_diagnostics,
     }
+    if merged_diagnostics.get("humanoid_contract"):
+        payload["humanoid_contract"] = merged_diagnostics["humanoid_contract"]
+    if merged_diagnostics.get("retarget_calibration"):
+        payload["retarget_calibration"] = merged_diagnostics["retarget_calibration"]
+    return payload
 
 
 def retarget_success_metadata(
@@ -39,6 +44,9 @@ def retarget_success_metadata(
         merged_diagnostics["retarget_calibration"] = calibration
     return {
         "retarget_status": "success",
+        "retarget_error_code": None,
+        "retarget_error_aliases": [],
+        "retarget_error_message": None,
         "animated_glb": str(output_path),
         "clip_name": getattr(clip, "name", "Kimodo Motion"),
         "duration": getattr(clip, "duration", None),

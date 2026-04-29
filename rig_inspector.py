@@ -159,13 +159,18 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
         diagnostics.append(f"humanoid_contract_schema_unsupported:{schema}")
         _raise_contract_error(sidecar_path, diagnostics)
 
-    roles = _parse_humanoid_roles(contract.get("roles"), nodes, skin_joint_indices, diagnostics)
-    chains = _parse_humanoid_chains(contract.get("chains"), roles, diagnostics)
+    contract_nodes = contract.get("nodes")
+    role_source = contract.get("roles") if "roles" in contract else _merged_canonical_role_source(contract, diagnostics)
+    canonical_role_nodes = contract_nodes if "roles" not in contract else None
+    roles = _parse_humanoid_roles(role_source, nodes, skin_joint_indices, diagnostics, contract_nodes=canonical_role_nodes)
+    chains = _parse_humanoid_chains(contract.get("chains"), roles, diagnostics, contract_nodes=contract_nodes)
     _validate_required_humanoid_contract(roles, chains, diagnostics)
     if diagnostics:
         _raise_contract_error(sidecar_path, diagnostics)
 
     rest = contract.get("rest") or contract.get("rest_pose") or contract.get("bind_data") or {}
+    if not isinstance(rest, dict) or not rest:
+        rest = _canonical_rest_from_nodes(contract_nodes, roles)
     basis_hints = contract.get("basis_hints") or contract.get("basis") or {}
     warnings = []
     quality = contract.get("quality") or contract.get("warnings") or ()
@@ -182,9 +187,21 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
     }
 
 
-def _parse_humanoid_roles(raw: Any, nodes: list[Any], skin_joint_indices: set[int], diagnostics: list[str]) -> dict[str, HumanoidRoleBinding]:
+def _parse_humanoid_roles(
+    raw: Any,
+    nodes: list[Any],
+    skin_joint_indices: set[int],
+    diagnostics: list[str],
+    *,
+    contract_nodes: Any = None,
+) -> dict[str, HumanoidRoleBinding]:
     entries: list[tuple[str, Any]] = []
-    if isinstance(raw, dict):
+    if isinstance(contract_nodes, dict):
+        entries = _canonical_humanoid_role_entries(raw, contract_nodes, diagnostics)
+    elif contract_nodes is not None:
+        diagnostics.append("humanoid_contract_invalid_shape:nodes")
+        return {}
+    elif isinstance(raw, dict):
         entries = [(str(role), binding) for role, binding in raw.items()]
     elif isinstance(raw, list):
         for entry in raw:
@@ -226,7 +243,124 @@ def _parse_humanoid_roles(raw: Any, nodes: list[Any], skin_joint_indices: set[in
     return roles
 
 
-def _parse_humanoid_chains(raw: Any, roles: dict[str, HumanoidRoleBinding], diagnostics: list[str]) -> dict[str, HumanoidChain]:
+def _canonical_humanoid_role_entries(
+    raw_required_roles: Any,
+    contract_nodes: dict[Any, Any],
+    diagnostics: list[str],
+) -> list[tuple[str, Any]]:
+    if not isinstance(raw_required_roles, dict):
+        diagnostics.append("humanoid_contract_invalid_shape:required_roles")
+        return []
+    entries: list[tuple[str, Any]] = []
+    for raw_role, raw_node_id in raw_required_roles.items():
+        role = str(raw_role)
+        if not isinstance(raw_node_id, str) or not raw_node_id.strip():
+            diagnostics.append(f"humanoid_contract_role_missing_node_id:{role}")
+            continue
+        node_id = raw_node_id.strip()
+        node = contract_nodes.get(node_id)
+        if not isinstance(node, dict):
+            diagnostics.append(f"humanoid_contract_role_unknown_node_id:{role}:{node_id}")
+            continue
+        node_index = node.get("index")
+        node_name = node.get("name", node_id)
+        if not isinstance(node_index, int):
+            diagnostics.append(f"humanoid_contract_node_missing_index:{node_id}")
+            continue
+        binding = {"node_index": node_index}
+        if isinstance(node_name, str) and node_name.strip():
+            binding["node_name"] = node_name.strip()
+        entries.append((role, binding))
+    return entries
+
+
+def _merged_canonical_role_source(contract: dict[str, Any], diagnostics: list[str]) -> dict[str, Any]:
+    required_roles = contract.get("required_roles")
+    if not isinstance(required_roles, dict):
+        diagnostics.append("humanoid_contract_invalid_shape:required_roles")
+        return {}
+    merged = dict(required_roles)
+    optional_roles = contract.get("optional_roles", {})
+    if optional_roles is None:
+        optional_roles = {}
+    if not isinstance(optional_roles, dict):
+        diagnostics.append("humanoid_contract_invalid_shape:optional_roles")
+        return merged
+    for role, node_id in optional_roles.items():
+        merged[str(role)] = node_id
+    return merged
+
+
+def _canonical_rest_from_nodes(contract_nodes: Any, roles: dict[str, HumanoidRoleBinding]) -> dict[str, Any]:
+    if not isinstance(contract_nodes, dict):
+        return {}
+    by_index = {binding.node_index: binding for binding in roles.values()}
+    role_rest: dict[str, Any] = {}
+    node_rest: dict[str, Any] = {}
+    for raw_node_id, node in contract_nodes.items():
+        if not isinstance(raw_node_id, str) or not isinstance(node, dict):
+            continue
+        transforms = node.get("transforms")
+        if not isinstance(transforms, dict):
+            continue
+        rest_local = _parse_matrix4(transforms.get("rest_local"))
+        rest_world = _parse_matrix4(transforms.get("rest_world"))
+        if rest_local is None and rest_world is None:
+            continue
+        entry: dict[str, Any] = {"node_id": raw_node_id}
+        local_translation = _matrix_translation(rest_local)
+        world_translation = _matrix_translation(rest_world)
+        if rest_local is not None:
+            entry["rest_local"] = rest_local
+        if rest_world is not None:
+            entry["rest_world"] = rest_world
+        if local_translation is not None:
+            entry["local_translation"] = local_translation
+        if world_translation is not None:
+            entry["world_translation"] = world_translation
+        node_name = node.get("name")
+        if isinstance(node_name, str) and node_name.strip():
+            node_rest[node_name.strip()] = dict(entry)
+        binding = by_index.get(node.get("index"))
+        if binding is not None:
+            role_rest[binding.role] = dict(entry)
+    if not role_rest and not node_rest:
+        return {}
+    return {
+        "source": "humanoid_contract.nodes.transforms",
+        "matrix_order": "row-major",
+        "roles": role_rest,
+        "nodes": node_rest,
+    }
+
+
+def _parse_matrix4(value: Any) -> list[list[float]] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    rows: list[list[float]] = []
+    try:
+        for row in value:
+            if not isinstance(row, list) or len(row) != 4:
+                return None
+            rows.append([float(component) for component in row])
+    except (TypeError, ValueError):
+        return None
+    return rows
+
+
+def _matrix_translation(matrix: list[list[float]] | None) -> list[float] | None:
+    if matrix is None:
+        return None
+    return [matrix[0][3], matrix[1][3], matrix[2][3]]
+
+
+def _parse_humanoid_chains(
+    raw: Any,
+    roles: dict[str, HumanoidRoleBinding],
+    diagnostics: list[str],
+    *,
+    contract_nodes: Any = None,
+) -> dict[str, HumanoidChain]:
     entries: list[tuple[str, Any]] = []
     if isinstance(raw, dict):
         entries = [(str(name), value) for name, value in raw.items()]
@@ -244,13 +378,43 @@ def _parse_humanoid_chains(raw: Any, roles: dict[str, HumanoidRoleBinding], diag
         if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
             diagnostics.append(f"humanoid_contract_invalid_chain:{raw_name}")
             continue
-        chain_roles = tuple(_canonical_role(role) for role in raw_roles)
-        missing = [role for role in chain_roles if role not in roles]
+        chain_roles, missing = _resolve_humanoid_chain_roles(raw_roles, roles, contract_nodes)
         if missing:
             diagnostics.append(f"humanoid_contract_chain_unknown_role:{name}:{','.join(missing)}")
             continue
         chains[name] = HumanoidChain(name=name, roles=chain_roles)
     return chains
+
+
+def _resolve_humanoid_chain_roles(
+    raw_roles: list[str],
+    roles: dict[str, HumanoidRoleBinding],
+    contract_nodes: Any,
+) -> tuple[tuple[str, ...], list[str]]:
+    node_id_to_role: dict[str, str] = {}
+    if isinstance(contract_nodes, dict):
+        index_to_role = {binding.node_index: role for role, binding in roles.items()}
+        for raw_node_id, node in contract_nodes.items():
+            if not isinstance(raw_node_id, str) or not isinstance(node, dict):
+                continue
+            node_index = node.get("index")
+            if isinstance(node_index, int) and node_index in index_to_role:
+                node_id_to_role[raw_node_id] = index_to_role[node_index]
+
+    resolved: list[str] = []
+    missing: list[str] = []
+    for raw_role in raw_roles:
+        role = _canonical_role(raw_role)
+        if role in roles:
+            resolved.append(role)
+            continue
+        if raw_role in node_id_to_role:
+            resolved.append(node_id_to_role[raw_role])
+            continue
+        if isinstance(contract_nodes, dict) and raw_role in contract_nodes:
+            continue
+        missing.append(role)
+    return tuple(resolved), missing
 
 
 def _validate_required_humanoid_contract(
@@ -282,6 +446,10 @@ def _raise_contract_error(path: Path, diagnostics: list[str]) -> None:
 def _canonical_role(value: str) -> str:
     normalized = _normalize(value)
     aliases = {
+        "leftshoulder": "left_shoulder",
+        "leftclavicle": "left_shoulder",
+        "rightshoulder": "right_shoulder",
+        "rightclavicle": "right_shoulder",
         "leftarm": "left_upper_arm",
         "leftupperarm": "left_upper_arm",
         "rightarm": "right_upper_arm",
@@ -317,6 +485,8 @@ def _canonical_chain_name(value: str) -> str:
         "spine": "torso",
         "leftarm": "left_arm",
         "rightarm": "right_arm",
+        "leftarmproximal": "left_arm_proximal",
+        "rightarmproximal": "right_arm_proximal",
         "leftleg": "left_leg",
         "rightleg": "right_leg",
     }

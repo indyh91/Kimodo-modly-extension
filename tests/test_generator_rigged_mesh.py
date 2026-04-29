@@ -105,6 +105,9 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
             validation_report = validate_bundle(animated.parent)
 
         self.assertEqual(metadata["retarget_status"], "success")
+        self.assertIsNone(metadata["retarget_error_code"])
+        self.assertIsNone(metadata["retarget_error_message"])
+        self.assertEqual(metadata["retarget_error_aliases"], [])
         self.assertEqual(metadata["source_rigged_mesh"], str(rig))
         self.assertEqual(metadata["source_kind"], "load_mesh_existing")
         self.assertEqual(metadata["diagnostics"]["rigged_mesh_path"], str(rig))

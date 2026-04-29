@@ -18,7 +18,7 @@ from host_compat import EXPERIMENTAL, UNSUPPORTED, resolve_host_compatibility
 from glb_animation_exporter import GlbAnimationExporter
 from kimodo_bvh import locate_bvh, parse_bvh
 from retarget_errors import RetargetError
-from retarget_metadata import retarget_failure_metadata, retarget_success_metadata
+from retarget_metadata import _humanoid_contract_metadata, retarget_failure_metadata, retarget_success_metadata
 from retargeting import build_retarget_clip
 from rig_inspector import inspect_rig
 
@@ -577,6 +577,9 @@ def retarget_motion_bundle(
             request["rigged_mesh_path"],
             source_kind=str(request.get("rigged_mesh_source_kind") or "unknown_mesh_source"),
         )
+        humanoid_contract = _humanoid_contract_metadata(rig)
+        if humanoid_contract:
+            diagnostics["humanoid_contract"] = humanoid_contract
         clip = build_retarget_clip(motion, rig)
         diagnostics["mapping_confidence"] = clip.mapping.confidence
         animated_path = GlbAnimationExporter().write_animation(rig, clip, output_path)
