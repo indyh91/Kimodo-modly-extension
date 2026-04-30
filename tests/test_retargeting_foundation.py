@@ -7,6 +7,8 @@ from pathlib import Path
 
 import sys
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -14,12 +16,29 @@ from glb_animation_exporter import GlbAnimationExporter, inspect_exporter_depend
 from kimodo_bvh import locate_bvh, parse_bvh  # noqa: E402
 from retarget_errors import CALIBRATION_UNAVAILABLE, EXPORT_FAILED, MAPPING_INCOMPATIBLE, MISSING_BVH, RetargetError  # noqa: E402
 from retarget_metadata import retarget_success_metadata  # noqa: E402
-from retargeting import JointMapping, RetargetChannel, RetargetClip, build_joint_mapping, build_retarget_clip  # noqa: E402
+from retargeting import (  # noqa: E402
+    JointMapping,
+    MotionContext,
+    RetargetChannel,
+    RetargetClip,
+    apply_contact_aware_foot_locking,
+    foot_trajectory_diagnostics,
+    stance_foot_slide_diagnostics,
+    _motion_quality_settings_for_role,
+    _target_basis_child_role,
+    build_joint_mapping,
+    build_retarget_clip,
+    load_motion_context,
+)
 from rig_inspector import inspect_rig  # noqa: E402
 from validation.animated_glb_validator import BufferResolver, decode_accessor  # noqa: E402
 
 
 FIXTURES = ROOT / "tests" / "fixtures"
+FIVE_MOTION_WORKFLOWS = {
+    "walking": Path("/home/drhepa/Documentos/Modly/workspace/Workflows/kimodo-20260429-230826-7caf3768"),
+    "dancing": Path("/home/drhepa/Documentos/Modly/workspace/Workflows/kimodo-20260429-231135-0118d38d"),
+}
 
 
 class RetargetingFoundationTests(unittest.TestCase):
@@ -599,6 +618,184 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(hand.diagnostics["motion_quality_filter"], "role_aware_conservative")
         self.assertTupleAlmostEqual(left_upper_arm.values[-1], self._axis_angle_quaternion_x(20.0))
 
+    def test_motion_quality_settings_keep_hand_at_65_and_forearm_lower_arm_at_75(self):
+        self.assertEqual(_motion_quality_settings_for_role("left_forearm"), (75.0, 16.0))
+        self.assertEqual(_motion_quality_settings_for_role("right_lower_arm"), (75.0, 16.0))
+        self.assertEqual(_motion_quality_settings_for_role("left_hand"), (65.0, 12.0))
+
+    def test_motion_quality_settings_cover_exact_full_body_roles(self):
+        expected = {
+            "hips": (45.0, 12.0),
+            "spine": (35.0, 10.0),
+            "chest": (45.0, 12.0),
+            "neck": (35.0, 12.0),
+            "head": (45.0, 16.0),
+            "left_shoulder": (90.0, 180.0),
+            "right_shoulder": (90.0, 180.0),
+            "left_upper_arm": (120.0, 180.0),
+            "right_upper_arm": (120.0, 180.0),
+            "left_forearm": (75.0, 16.0),
+            "right_lower_arm": (75.0, 16.0),
+            "left_hand": (65.0, 12.0),
+            "right_hand": (65.0, 12.0),
+            "left_upper_leg": (110.0, 20.0),
+            "right_upper_leg": (110.0, 20.0),
+            "left_lower_leg": (125.0, 18.0),
+            "right_lower_leg": (125.0, 18.0),
+            "left_foot": (70.0, 14.0),
+            "right_foot": (70.0, 14.0),
+        }
+
+        for role, settings in expected.items():
+            with self.subTest(role=role):
+                self.assertEqual(_motion_quality_settings_for_role(role), settings)
+
+    def test_motion_context_prefers_smooth_root_and_reports_foot_contact_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            npz_path = Path(tmp) / "motion.npz"
+            np.savez(
+                npz_path,
+                root_positions=np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0]], dtype=float),
+                smooth_root_pos=np.array([[2.0, 1.0, 3.0], [2.6, 1.4, 4.0]], dtype=float),
+                foot_contacts=np.array([[1, 0, 1, 0, 0, 1], [0, 1, 0, 1, 1, 0]], dtype=float),
+            )
+
+            context = load_motion_context(npz_path)
+
+        self.assertIsInstance(context, MotionContext)
+        self.assertEqual(context.root_source, "smooth_root_pos")
+        self.assertEqual(context.root_frame_count, 2)
+        self.assertEqual(context.foot_contact_shape, (2, 6))
+        self.assertAlmostEqual(context.foot_contact_ratio, 0.5)
+        self.assertEqual(context.root_deltas(frame_count=2), ((0.0, 0.0, 0.0), (0.6, 0.0, 1.0)))
+
+    def test_locomotion_policy_uses_npz_deltas_not_raw_child_hips_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bvh_path = Path(tmp) / "walking_child_hips.bvh"
+            rig_path = Path(tmp) / "anonymous_unirig.gltf"
+            npz_path = Path(tmp) / "motion.npz"
+            self._write_static_root_with_hips_position_bvh(
+                bvh_path,
+                first_hips=(0.0, 0.0, 0.0),
+                second_hips=(0.0, 0.0, 650.0),
+            )
+            self._write_anonymous_unirig_46(rig_path)
+            np.savez(
+                npz_path,
+                smooth_root_pos=np.array([[10.0, 2.0, 20.0], [11.2, 2.7, 20.8]], dtype=float),
+                root_positions=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 650.0]], dtype=float),
+                foot_contacts=np.ones((2, 6), dtype=float),
+            )
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = load_motion_context(npz_path)
+
+        clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        translation = next(channel for channel in clip.channels if channel.target_joint == "bone_0" and channel.path == "translation")
+        self.assertEqual(translation.values, ((0.0, 0.0, 0.0), (1.2, 0.0, 0.8)))
+        self.assertEqual(translation.diagnostics["root_motion_source"], "smooth_root_pos")
+        self.assertEqual(translation.diagnostics["root_motion_mode"], "preserve_scaled_npz_root_motion")
+        self.assertNotEqual(translation.values[-1], (0.0, 0.0, 650.0))
+        policy = clip.calibration["locomotion_policy"]
+        self.assertTrue(policy["detected_locomotion"])
+        self.assertEqual(policy["mode"], "preserve_scaled_npz_root_motion")
+        self.assertEqual(policy["source"], "smooth_root_pos")
+        self.assertEqual(policy["foot_contact_shape"], [2, 6])
+        self.assertIn("contact_aware_foot_locking", policy["deferred"])
+
+    def test_invalid_motion_context_keeps_hips_suppressed_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bvh_path = Path(tmp) / "static_root_hips_motion.bvh"
+            rig_path = Path(tmp) / "anonymous_unirig.gltf"
+            self._write_static_root_with_hips_position_bvh(
+                bvh_path,
+                first_hips=(10.0, 0.5, -3.0),
+                second_hips=(12.25, 1.5, 0.5),
+            )
+            self._write_anonymous_unirig_46(rig_path)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(path=None, root_positions=((0.0, 0.0),), smooth_root_pos=None, foot_contacts=None, source_keys=("root_positions",), warnings=())
+
+        clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        translation = next(channel for channel in clip.channels if channel.target_joint == "bone_0" and channel.path == "translation")
+        self.assertEqual(translation.values, ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+        policy = clip.calibration["locomotion_policy"]
+        self.assertFalse(policy["detected_locomotion"])
+        self.assertEqual(policy["mode"], "hips_suppressed_in_place")
+        self.assertEqual(policy["source"], "none")
+        self.assertIn("invalid_root_positions_shape", policy["warnings"])
+
+    def test_source_and_retarget_foot_trajectory_diagnostics_report_forward_lateral_dominance(self):
+        source_left = ((0.0, 0.0, 0.0), (0.04, 0.0, 0.50), (0.08, 0.0, 1.00))
+        source_right = ((0.0, 0.0, 0.0), (-0.05, 0.0, 0.45), (-0.10, 0.0, 0.95))
+        retarget_left = ((0.0, 0.0, 0.0), (0.70, 0.0, 0.20), (1.40, 0.0, 0.58))
+        retarget_right = ((0.0, 0.0, 0.0), (-0.56, 0.0, 0.16), (-1.12, 0.0, 0.34))
+
+        diagnostics = foot_trajectory_diagnostics(
+            source_feet={"left": source_left, "right": source_right},
+            retarget_feet={"left": retarget_left, "right": retarget_right},
+        )
+
+        self.assertEqual(diagnostics["source"]["left"]["dominant_axis"], "forward")
+        self.assertEqual(diagnostics["source"]["right"]["dominant_axis"], "forward")
+        self.assertEqual(diagnostics["retarget"]["left"]["dominant_axis"], "lateral")
+        self.assertEqual(diagnostics["retarget"]["right"]["dominant_axis"], "lateral")
+        self.assertAlmostEqual(diagnostics["source"]["left"]["forward_range"], 1.0)
+        self.assertAlmostEqual(diagnostics["retarget"]["left"]["lateral_range"], 1.4)
+        self.assertEqual(diagnostics["alignment"], "mismatch")
+
+    def test_stance_foot_slide_diagnostics_use_foot_contacts_windows(self):
+        foot_samples = {
+            "left": ((0.0, 0.0, 0.0), (0.05, 0.0, 0.02), (0.80, 0.0, 0.00), (0.82, 0.0, 0.01)),
+            "right": ((0.0, 0.0, 0.0), (0.40, 0.0, 0.0), (0.42, 0.0, 0.0), (0.43, 0.0, 0.0)),
+        }
+        contacts = (
+            (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+        )
+
+        diagnostics = stance_foot_slide_diagnostics(foot_samples, contacts)
+
+        self.assertEqual(diagnostics["contact_shape"], [4, 6])
+        self.assertAlmostEqual(diagnostics["contact_ratio"], 2.0 / 12.0)
+        self.assertEqual(diagnostics["left"]["windows"], [[0, 1]])
+        self.assertEqual(diagnostics["right"]["windows"], [[2, 3]])
+        self.assertAlmostEqual(diagnostics["left"]["max_slide"], math.hypot(0.05, 0.02))
+        self.assertAlmostEqual(diagnostics["right"]["max_slide"], 0.01)
+
+    def test_contact_aware_foot_locking_reduces_stance_slide_without_moving_swing_samples(self):
+        foot_samples = {
+            "left": ((0.0, 0.0, 0.0), (0.20, 0.0, 0.00), (0.40, 0.0, 0.00), (0.60, 0.0, 0.00)),
+            "right": ((0.0, 0.0, 0.0), (0.00, 0.0, 0.30), (0.00, 0.0, 0.60), (0.00, 0.0, 0.90)),
+        }
+        contacts = (
+            (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+        )
+
+        locked, diagnostics = apply_contact_aware_foot_locking(foot_samples, contacts)
+
+        self.assertEqual(locked["left"][0], (0.0, 0.0, 0.0))
+        self.assertEqual(locked["left"][1], (0.0, 0.0, 0.0))
+        self.assertEqual(locked["left"][2], foot_samples["left"][2])
+        self.assertEqual(locked["right"][2], foot_samples["right"][2])
+        self.assertEqual(locked["right"][3], foot_samples["right"][2])
+        self.assertEqual(diagnostics["status"], "applied")
+        self.assertLess(diagnostics["post"]["summary"]["max_slide"], diagnostics["pre"]["summary"]["max_slide"])
+
+    def test_leg_basis_child_roles_use_knee_to_foot_axis_without_affecting_arms(self):
+        self.assertEqual(_target_basis_child_role("left_lower_leg"), "left_foot")
+        self.assertEqual(_target_basis_child_role("right_lower_leg"), "right_foot")
+        self.assertEqual(_target_basis_child_role("left_upper_leg"), "left_lower_leg")
+        self.assertEqual(_target_basis_child_role("left_upper_arm"), "left_forearm")
+
     def test_calibrated_motion_quality_filter_reduces_hand_forearm_frame_jumps_without_root_translation_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
@@ -689,6 +886,46 @@ class RetargetingFoundationTests(unittest.TestCase):
                 self.assertEqual(left["max_frame_jump_degrees"], right["max_frame_jump_degrees"])
                 self.assertEqual(left["clamp_count"], right["clamp_count"])
 
+    def test_motion_quality_diagnostics_include_torso_legs_feet_without_filtering_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "full_body_diagnostic_avatar.gltf"
+            bvh_path = Path(tmp) / "full_body_diagnostic_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            self._write_motion_quality_contract_bvh(
+                bvh_path,
+                hips_x_degrees=(0.0, 80.0, 10.0),
+                spine_x_degrees=(0.0, 60.0, 8.0),
+                chest_x_degrees=(0.0, 80.0, 10.0),
+                neck_x_degrees=(0.0, 60.0, 8.0),
+                head_x_degrees=(0.0, 80.0, 10.0),
+                left_upper_leg_x_degrees=(0.0, 140.0, 15.0),
+                right_upper_leg_x_degrees=(0.0, 140.0, 15.0),
+                left_lower_leg_x_degrees=(0.0, 150.0, 15.0),
+                right_lower_leg_x_degrees=(0.0, 150.0, 15.0),
+                left_foot_x_degrees=(0.0, 95.0, 10.0),
+                right_foot_x_degrees=(0.0, 95.0, 10.0),
+                root_x_positions=(0.0, 1.0, 2.0),
+            )
+            rig = inspect_rig(rig_path)
+            motion = parse_bvh(bvh_path)
+
+        clip = build_retarget_clip(motion, rig)
+
+        diagnostics = clip.calibration["motion_quality_diagnostics"]
+        roles = {entry["role"]: entry for entry in diagnostics["channels"]}
+        for role in ("hips", "spine", "chest", "neck", "head", "left_upper_leg", "right_upper_leg", "left_lower_leg", "right_lower_leg", "left_foot", "right_foot"):
+            with self.subTest(role=role):
+                self.assertIn(role, roles)
+                self.assertEqual(roles[role]["filter_profile"], "role_aware_conservative")
+                self.assertGreater(roles[role]["changed_sample_count"], 0)
+        self.assertIn("upper_leg", diagnostics["left_right_summary"])
+        self.assertIn("lower_leg", diagnostics["left_right_summary"])
+        self.assertIn("foot", diagnostics["left_right_summary"])
+        translation = next(channel for channel in clip.channels if channel.path == "translation")
+        self.assertNotIn("motion_quality_filter", translation.diagnostics)
+        self.assertTrue(all(entry["path"] == "rotation" for entry in diagnostics["channels"]))
+
     def test_motion_quality_diagnostics_do_not_mark_translation_channels_filtered(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
@@ -733,6 +970,61 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(diagnostics["motion_quality_filter"], "role_aware_conservative")
         self.assertEqual(top_level["motion_quality_filter"], "role_aware_conservative")
         self.assertGreater(len(diagnostics["channels"]), 0)
+
+    def test_locomotion_policy_survives_success_metadata_integration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bvh_path = Path(tmp) / "walking_child_hips.bvh"
+            rig_path = Path(tmp) / "anonymous_unirig.gltf"
+            output_path = Path(tmp) / "animated.glb"
+            self._write_static_root_with_hips_position_bvh(
+                bvh_path,
+                first_hips=(0.0, 0.0, 0.0),
+                second_hips=(0.0, 0.0, 650.0),
+            )
+            self._write_anonymous_unirig_46(rig_path)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(
+                path=Path(tmp) / "motion.npz",
+                root_positions=None,
+                smooth_root_pos=((1.0, 0.5, 2.0), (1.8, 0.7, 2.1)),
+                foot_contacts=((1.0, 0.0, 1.0, 0.0, 1.0, 0.0), (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)),
+                source_keys=("smooth_root_pos", "foot_contacts"),
+                warnings=(),
+            )
+
+        clip = build_retarget_clip(motion, rig, motion_context=context)
+        metadata = retarget_success_metadata(output_path, rig=rig, clip=clip, warnings=clip.warnings)
+
+        policy = metadata["diagnostics"]["retarget_calibration"]["locomotion_policy"]
+        self.assertEqual(policy["mode"], "preserve_scaled_npz_root_motion")
+        self.assertEqual(policy["source"], "smooth_root_pos")
+        self.assertEqual(policy["foot_contact_shape"], [2, 6])
+        contact_locking = metadata["diagnostics"]["retarget_calibration"]["contact_aware_foot_locking"]
+        self.assertEqual(contact_locking["status"], "metadata_only")
+        self.assertEqual(contact_locking["contact_shape"], [2, 6])
+        self.assertEqual(contact_locking["left_windows"], [[0, 0]])
+        self.assertEqual(contact_locking["right_windows"], [[1, 1]])
+        self.assertIn("world_space_leg_ik", contact_locking["deferred"])
+        self.assertIsNone(metadata["retarget_calibration"])
+
+    def test_five_motion_npz_contexts_expose_required_keys_and_locomotion_evidence(self):
+        contexts = {}
+        for label, workflow_dir in FIVE_MOTION_WORKFLOWS.items():
+            npz_path = workflow_dir / "motion.npz"
+            self.assertTrue(npz_path.is_file(), f"missing fixture motion.npz for {label}")
+            with np.load(npz_path) as payload:
+                self.assertIn("foot_contacts", payload.files)
+                self.assertIn("root_positions", payload.files)
+                self.assertIn("smooth_root_pos", payload.files)
+            contexts[label] = load_motion_context(npz_path)
+
+        walking_policy = contexts["walking"].locomotion_policy(frame_count=contexts["walking"].root_frame_count)
+        dancing_policy = contexts["dancing"].locomotion_policy(frame_count=contexts["dancing"].root_frame_count)
+        self.assertTrue(walking_policy["detected_locomotion"])
+        self.assertEqual(walking_policy["source"], "smooth_root_pos")
+        self.assertEqual(dancing_policy["foot_contact_shape"], list(contexts["dancing"].foot_contact_shape))
+        self.assertGreaterEqual(dancing_policy["foot_contact_ratio"], 0.0)
 
     def test_humanoid_contract_absent_preserves_anonymous_fallback(self):
         motion = parse_bvh(FIXTURES / "synthetic_walk.bvh")
@@ -1402,6 +1694,17 @@ Frame Time: 0.0333333
         right_forearm_x_degrees: tuple[float, ...] = (0.0,),
         right_hand_x_degrees: tuple[float, ...] = (0.0,),
         left_upper_arm_x_degrees: tuple[float, ...] = (0.0,),
+        hips_x_degrees: tuple[float, ...] = (0.0,),
+        spine_x_degrees: tuple[float, ...] = (0.0,),
+        chest_x_degrees: tuple[float, ...] = (0.0,),
+        neck_x_degrees: tuple[float, ...] = (0.0,),
+        head_x_degrees: tuple[float, ...] = (0.0,),
+        left_upper_leg_x_degrees: tuple[float, ...] = (0.0,),
+        right_upper_leg_x_degrees: tuple[float, ...] = (0.0,),
+        left_lower_leg_x_degrees: tuple[float, ...] = (0.0,),
+        right_lower_leg_x_degrees: tuple[float, ...] = (0.0,),
+        left_foot_x_degrees: tuple[float, ...] = (0.0,),
+        right_foot_x_degrees: tuple[float, ...] = (0.0,),
         root_x_positions: tuple[float, ...] = (0.0,),
     ) -> None:
         hierarchy = """HIERARCHY
@@ -1492,14 +1795,41 @@ ROOT Hips
 }
 MOTION
 """
-        frame_count = max(len(right_forearm_x_degrees), len(right_hand_x_degrees), len(left_upper_arm_x_degrees), len(root_x_positions))
+        frame_count = max(
+            len(right_forearm_x_degrees),
+            len(right_hand_x_degrees),
+            len(left_upper_arm_x_degrees),
+            len(hips_x_degrees),
+            len(spine_x_degrees),
+            len(chest_x_degrees),
+            len(neck_x_degrees),
+            len(head_x_degrees),
+            len(left_upper_leg_x_degrees),
+            len(right_upper_leg_x_degrees),
+            len(left_lower_leg_x_degrees),
+            len(right_lower_leg_x_degrees),
+            len(left_foot_x_degrees),
+            len(right_foot_x_degrees),
+            len(root_x_positions),
+        )
         frames = []
         for index in range(frame_count):
             frame = [0.0] * 54
             frame[0] = root_x_positions[min(index, len(root_x_positions) - 1)]
+            frame[4] = hips_x_degrees[min(index, len(hips_x_degrees) - 1)]
+            frame[7] = spine_x_degrees[min(index, len(spine_x_degrees) - 1)]
+            frame[10] = chest_x_degrees[min(index, len(chest_x_degrees) - 1)]
+            frame[13] = neck_x_degrees[min(index, len(neck_x_degrees) - 1)]
+            frame[16] = head_x_degrees[min(index, len(head_x_degrees) - 1)]
             frame[19] = left_upper_arm_x_degrees[min(index, len(left_upper_arm_x_degrees) - 1)]
             frame[31] = right_forearm_x_degrees[min(index, len(right_forearm_x_degrees) - 1)]
             frame[34] = right_hand_x_degrees[min(index, len(right_hand_x_degrees) - 1)]
+            frame[37] = left_upper_leg_x_degrees[min(index, len(left_upper_leg_x_degrees) - 1)]
+            frame[40] = left_lower_leg_x_degrees[min(index, len(left_lower_leg_x_degrees) - 1)]
+            frame[43] = left_foot_x_degrees[min(index, len(left_foot_x_degrees) - 1)]
+            frame[46] = right_upper_leg_x_degrees[min(index, len(right_upper_leg_x_degrees) - 1)]
+            frame[49] = right_lower_leg_x_degrees[min(index, len(right_lower_leg_x_degrees) - 1)]
+            frame[52] = right_foot_x_degrees[min(index, len(right_foot_x_degrees) - 1)]
             frames.append(" ".join(str(value) for value in frame))
         path.write_text(f"{hierarchy}Frames: {frame_count}\nFrame Time: 0.0333333\n" + "\n".join(frames) + "\n", encoding="utf-8")
 

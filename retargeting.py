@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from kimodo_bvh import BvhMotion
 from retarget_errors import CALIBRATION_UNAVAILABLE, MAPPING_INCOMPATIBLE, RetargetError
@@ -60,6 +61,8 @@ TARGET_BASIS_CHILD_ROLES = {
     "right_shoulder": "right_upper_arm",
     "left_upper_leg": "left_lower_leg",
     "right_upper_leg": "right_lower_leg",
+    "left_lower_leg": "left_foot",
+    "right_lower_leg": "right_foot",
     "left_upper_arm": "left_forearm",
     "right_upper_arm": "right_forearm",
 }
@@ -123,6 +126,111 @@ class RetargetClip:
     calibration: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class MotionContext:
+    path: Path | None
+    root_positions: tuple[tuple[float, ...], ...] | None = None
+    smooth_root_pos: tuple[tuple[float, ...], ...] | None = None
+    foot_contacts: tuple[tuple[float, ...], ...] | None = None
+    source_keys: tuple[str, ...] = field(default_factory=tuple)
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def root_source(self) -> str:
+        if _valid_root_positions(self.smooth_root_pos):
+            return "smooth_root_pos"
+        if _valid_root_positions(self.root_positions):
+            return "root_positions"
+        return "none"
+
+    @property
+    def root_samples(self) -> tuple[tuple[float, float, float], ...] | None:
+        selected = self.smooth_root_pos if self.root_source == "smooth_root_pos" else self.root_positions
+        if not _valid_root_positions(selected):
+            return None
+        return tuple((float(sample[0]), float(sample[1]), float(sample[2])) for sample in selected or ())
+
+    @property
+    def root_frame_count(self) -> int:
+        samples = self.root_samples
+        return len(samples) if samples is not None else 0
+
+    @property
+    def foot_contact_shape(self) -> tuple[int, ...]:
+        return _array_shape(self.foot_contacts)
+
+    @property
+    def foot_contact_ratio(self) -> float:
+        if not self.foot_contacts:
+            return 0.0
+        values = [float(value) for row in self.foot_contacts for value in row]
+        return sum(values) / len(values) if values else 0.0
+
+    def root_deltas(self, *, frame_count: int) -> tuple[tuple[float, float, float], ...]:
+        samples = self.root_samples
+        if samples is None or len(samples) != frame_count or not samples:
+            return tuple((0.0, 0.0, 0.0) for _ in range(frame_count))
+        origin = samples[0]
+        return tuple((_clean_float(sample[0] - origin[0]), 0.0, _clean_float(sample[2] - origin[2])) for sample in samples)
+
+    def locomotion_policy(self, *, frame_count: int, fallback_mode: str = "hips_suppressed_in_place") -> dict[str, object]:
+        samples = self.root_samples
+        warnings = list(self.warnings)
+        source = self.root_source
+        detected = False
+        horizontal_range = 0.0
+        displacement = (0.0, 0.0, 0.0)
+        mode = fallback_mode
+        if source == "none":
+            warnings.extend(_invalid_root_position_warnings(self))
+        elif samples is None or len(samples) != frame_count:
+            warnings.append("root_positions_frame_count_mismatch")
+        else:
+            xs = [sample[0] for sample in samples]
+            zs = [sample[2] for sample in samples]
+            horizontal_range = math.hypot(max(xs) - min(xs), max(zs) - min(zs))
+            displacement = (samples[-1][0] - samples[0][0], 0.0, samples[-1][2] - samples[0][2])
+            horizontal_displacement = math.hypot(displacement[0], displacement[2])
+            if max(horizontal_range, horizontal_displacement) >= 0.5:
+                if max(horizontal_range, horizontal_displacement) <= 20.0:
+                    detected = True
+                    mode = "preserve_scaled_npz_root_motion"
+                else:
+                    warnings.append("root_displacement_sanity_clamped_as_invalid")
+        return {
+            "mode": mode,
+            "source": source if source != "none" and not any(warning.startswith("root_positions_frame_count_mismatch") for warning in warnings) else (source if source != "none" else "none"),
+            "detected_locomotion": detected,
+            "root_horizontal_range": _clean_float(horizontal_range),
+            "root_displacement": [_clean_float(value) for value in displacement],
+            "foot_contact_shape": list(self.foot_contact_shape),
+            "foot_contact_ratio": _clean_float(self.foot_contact_ratio),
+            "warnings": _unique_list(warnings),
+            "deferred": ["contact_aware_foot_locking"],
+        }
+
+
+def load_motion_context(path: Path | str | None) -> MotionContext | None:
+    if path is None:
+        return None
+    npz_path = Path(path)
+    try:
+        import numpy as np
+
+        with np.load(npz_path) as payload:
+            keys = tuple(str(key) for key in payload.files)
+            return MotionContext(
+                path=npz_path,
+                root_positions=_array_to_tuple(payload["root_positions"]) if "root_positions" in payload.files else None,
+                smooth_root_pos=_array_to_tuple(payload["smooth_root_pos"]) if "smooth_root_pos" in payload.files else None,
+                foot_contacts=_array_to_tuple(payload["foot_contacts"]) if "foot_contacts" in payload.files else None,
+                source_keys=keys,
+                warnings=(),
+            )
+    except Exception as exc:
+        return MotionContext(path=npz_path, source_keys=(), warnings=(f"motion_context_load_failed:{type(exc).__name__}",))
+
+
 def build_joint_mapping(source: BvhMotion, target: RigInspection) -> JointMapping:
     source_lookup = {_normalize(name): name for name in source.joints}
     calibrated_mapping = _build_calibrated_contract_mapping(source, source_lookup, target)
@@ -183,7 +291,7 @@ def _build_humanoid_contract_mapping(source_lookup: dict[str, str], target: RigI
     return JointMapping(pairs=pairs, confidence=confidence, warnings=warnings)
 
 
-def build_retarget_clip(source: BvhMotion, target: RigInspection) -> RetargetClip:
+def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context: MotionContext | None = None) -> RetargetClip:
     mapping = build_joint_mapping(source, target)
     times = tuple(index * source.frame_time for index in range(len(source.frames)))
     root_target = _root_motion_target(source, mapping)
@@ -191,6 +299,11 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection) -> RetargetCli
     root_motion_source = _root_motion_source_joint(source, mapping)
     root_motion_source_label = "hips_suppressed_in_place" if suppressed_hips_source is not None else _root_motion_source_label(source, root_motion_source)
     translations = _position_samples_for_joint(source, root_motion_source)
+    fallback_mode = "hips_suppressed_in_place" if suppressed_hips_source is not None else "preserve_bvh_root_translation"
+    locomotion_policy = _locomotion_policy_for_context(motion_context, frame_count=len(source.frames), fallback_mode=fallback_mode)
+    if locomotion_policy["mode"] == "preserve_scaled_npz_root_motion" and motion_context is not None:
+        translations = list(motion_context.root_deltas(frame_count=len(source.frames)))
+        root_motion_source_label = str(locomotion_policy["source"])
     channels: list[RetargetChannel] = []
     if root_target is not None:
         diagnostics = {
@@ -198,7 +311,11 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection) -> RetargetCli
             "source_joint": root_motion_source,
             "target_joint": root_target,
         }
-        if suppressed_hips_source is not None:
+        if locomotion_policy["mode"] == "preserve_scaled_npz_root_motion":
+            diagnostics["root_motion_mode"] = "preserve_scaled_npz_root_motion"
+            if suppressed_hips_source is not None:
+                diagnostics["suppressed_source_joint"] = suppressed_hips_source
+        elif suppressed_hips_source is not None:
             diagnostics["suppressed_source_joint"] = suppressed_hips_source
             diagnostics["root_motion_mode"] = "in_place_default"
         channels.append(
@@ -219,12 +336,18 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection) -> RetargetCli
         "rotation_order_assumption_bvh_channel_order_local_xyzw_quaternion",
         "root_motion_mode_preserve_translation",
     ]
-    if suppressed_hips_source is not None:
+    if locomotion_policy["mode"] == "preserve_scaled_npz_root_motion":
+        root_motion_warnings.append("root_motion_mode_preserve_scaled_npz_root_motion")
+    elif suppressed_hips_source is not None:
         root_motion_warnings.append("root_motion_mode_in_place_default")
         root_motion_warnings.append(f"root_motion_hips_detected_suppressed:{suppressed_hips_source}")
     root_motion_warnings.append(f"root_motion_source:{root_motion_source_label}")
     warnings = _unique_tuple(mapping.warnings + target.warnings + tuple(root_motion_warnings))
     calibration = _calibration_metadata(target, mapping) if mapping.confidence == "calibrated" else {}
+    calibration["locomotion_policy"] = locomotion_policy
+    contact_locking_diagnostics = _contact_locking_metadata_for_context(motion_context, frame_count=len(source.frames))
+    if contact_locking_diagnostics is not None:
+        calibration["contact_aware_foot_locking"] = contact_locking_diagnostics
     if calibration:
         calibration["root_motion_source"] = root_motion_source_label
         motion_quality_diagnostics = _motion_quality_diagnostics_metadata(channels)
@@ -794,6 +917,197 @@ def _build_calibrated_rotation_channels(source: BvhMotion, mapping: JointMapping
     return tuple(channels)
 
 
+def foot_trajectory_diagnostics(
+    *,
+    source_feet: dict[str, tuple[tuple[float, float, float], ...]],
+    retarget_feet: dict[str, tuple[tuple[float, float, float], ...]],
+) -> dict[str, object]:
+    """Report forward/lateral dominance for source and retarget foot paths.
+
+    Coordinates intentionally stay in the project's existing horizontal convention:
+    X is lateral and Z is forward. The function is pure so diagnostic tests can
+    exercise it without requiring GLB export or runtime assets.
+    """
+
+    source = {side: _trajectory_axis_metrics(samples) for side, samples in source_feet.items()}
+    retarget = {side: _trajectory_axis_metrics(samples) for side, samples in retarget_feet.items()}
+    sides = sorted(set(source) & set(retarget))
+    mismatched_sides = [side for side in sides if source[side]["dominant_axis"] != retarget[side]["dominant_axis"]]
+    return {
+        "coordinate_convention": {"lateral_axis": "x", "forward_axis": "z"},
+        "source": source,
+        "retarget": retarget,
+        "alignment": "mismatch" if mismatched_sides else "aligned",
+        "mismatched_sides": mismatched_sides,
+    }
+
+
+def stance_foot_slide_diagnostics(
+    foot_samples: dict[str, tuple[tuple[float, float, float], ...]],
+    foot_contacts: tuple[tuple[float, ...], ...] | None,
+    *,
+    contact_threshold: float = 0.5,
+) -> dict[str, object]:
+    """Measure horizontal stance-foot slide over contact windows."""
+
+    shape = _array_shape(foot_contacts)
+    ratio = _contact_ratio(foot_contacts)
+    result: dict[str, object] = {
+        "contact_shape": list(shape),
+        "contact_ratio": _clean_float(ratio),
+        "contact_threshold": contact_threshold,
+    }
+    max_slide = 0.0
+    total_windows = 0
+    for side in ("left", "right"):
+        samples = foot_samples.get(side, ())
+        windows = _contact_windows(foot_contacts, side=side, frame_count=len(samples), contact_threshold=contact_threshold)
+        window_metrics = [_stance_window_slide(samples, start, end) for start, end in windows]
+        side_max = max(window_metrics) if window_metrics else 0.0
+        max_slide = max(max_slide, side_max)
+        total_windows += len(windows)
+        result[side] = {
+            "windows": [[start, end] for start, end in windows],
+            "window_count": len(windows),
+            "max_slide": _clean_float(side_max),
+            "window_slides": [_clean_float(value) for value in window_metrics],
+        }
+    result["summary"] = {
+        "window_count": total_windows,
+        "max_slide": _clean_float(max_slide),
+    }
+    return result
+
+
+def apply_contact_aware_foot_locking(
+    foot_samples: dict[str, tuple[tuple[float, float, float], ...]],
+    foot_contacts: tuple[tuple[float, ...], ...] | None,
+    *,
+    contact_threshold: float = 0.5,
+) -> tuple[dict[str, tuple[tuple[float, float, float], ...]], dict[str, object]]:
+    """Lock stance windows to their first foot sample and report pre/post slide.
+
+    This is the conservative phase-2 primitive: it operates on explicit target or
+    proxy foot trajectories and does not pretend to solve full world-space IK.
+    """
+
+    pre = stance_foot_slide_diagnostics(foot_samples, foot_contacts, contact_threshold=contact_threshold)
+    locked: dict[str, tuple[tuple[float, float, float], ...]] = {}
+    applied = False
+    for side, samples in foot_samples.items():
+        mutable = [tuple(float(component) for component in sample) for sample in samples]
+        for start, end in _contact_windows(foot_contacts, side=side, frame_count=len(samples), contact_threshold=contact_threshold):
+            if 0 <= start < len(mutable):
+                anchor = mutable[start]
+                for index in range(start, min(end + 1, len(mutable))):
+                    if mutable[index] != anchor:
+                        applied = True
+                    mutable[index] = anchor
+        locked[side] = tuple(mutable)
+    post = stance_foot_slide_diagnostics(locked, foot_contacts, contact_threshold=contact_threshold)
+    diagnostics = {
+        "status": "applied" if applied else "not_applied",
+        "algorithm": "stance_window_anchor_lock",
+        "pre": pre,
+        "post": post,
+        "deferred": ["world_space_leg_ik"],
+    }
+    return locked, diagnostics
+
+
+def _trajectory_axis_metrics(samples: tuple[tuple[float, float, float], ...]) -> dict[str, object]:
+    if not samples:
+        return {"sample_count": 0, "lateral_range": 0.0, "forward_range": 0.0, "dominant_axis": "none"}
+    xs = [float(sample[0]) for sample in samples]
+    zs = [float(sample[2]) for sample in samples]
+    lateral_range = max(xs) - min(xs)
+    forward_range = max(zs) - min(zs)
+    dominant = "forward" if forward_range >= lateral_range else "lateral"
+    if max(forward_range, lateral_range) <= 1e-9:
+        dominant = "none"
+    return {
+        "sample_count": len(samples),
+        "lateral_range": _clean_float(lateral_range),
+        "forward_range": _clean_float(forward_range),
+        "dominant_axis": dominant,
+    }
+
+
+def _contact_locking_metadata_for_context(motion_context: MotionContext | None, *, frame_count: int) -> dict[str, object] | None:
+    if motion_context is None or motion_context.foot_contacts is None:
+        return None
+    if len(motion_context.foot_contacts) != frame_count:
+        return {
+            "status": "not_applied",
+            "reason": "foot_contacts_frame_count_mismatch",
+            "contact_shape": list(motion_context.foot_contact_shape),
+            "contact_ratio": _clean_float(motion_context.foot_contact_ratio),
+            "deferred": ["world_space_leg_ik"],
+        }
+    diagnostics = stance_foot_slide_diagnostics(
+        {
+            "left": tuple((0.0, 0.0, 0.0) for _ in range(frame_count)),
+            "right": tuple((0.0, 0.0, 0.0) for _ in range(frame_count)),
+        },
+        motion_context.foot_contacts,
+    )
+    return {
+        "status": "metadata_only",
+        "reason": "no_target_foot_translation_channels_available_for_world_space_lock",
+        "algorithm": "stance_window_anchor_lock",
+        "contact_shape": diagnostics["contact_shape"],
+        "contact_ratio": diagnostics["contact_ratio"],
+        "left_windows": diagnostics["left"]["windows"],
+        "right_windows": diagnostics["right"]["windows"],
+        "deferred": ["world_space_leg_ik"],
+    }
+
+
+def _contact_ratio(foot_contacts: tuple[tuple[float, ...], ...] | None) -> float:
+    if not foot_contacts:
+        return 0.0
+    values = [float(value) for row in foot_contacts for value in row]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _contact_windows(
+    foot_contacts: tuple[tuple[float, ...], ...] | None,
+    *,
+    side: str,
+    frame_count: int,
+    contact_threshold: float,
+) -> list[tuple[int, int]]:
+    if not foot_contacts or frame_count <= 0:
+        return []
+    column = 0 if side == "left" else 1
+    active = []
+    for index in range(min(frame_count, len(foot_contacts))):
+        row = foot_contacts[index]
+        active.append(len(row) > column and float(row[column]) >= contact_threshold)
+    windows: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, is_active in enumerate(active):
+        if is_active and start is None:
+            start = index
+        elif not is_active and start is not None:
+            windows.append((start, index - 1))
+            start = None
+    if start is not None:
+        windows.append((start, len(active) - 1))
+    return windows
+
+
+def _stance_window_slide(samples: tuple[tuple[float, float, float], ...], start: int, end: int) -> float:
+    if not samples or start >= len(samples):
+        return 0.0
+    anchor = samples[start]
+    max_distance = 0.0
+    for index in range(start, min(end + 1, len(samples))):
+        sample = samples[index]
+        max_distance = max(max_distance, math.hypot(float(sample[0]) - float(anchor[0]), float(sample[2]) - float(anchor[2])))
+    return max_distance
+
+
 def _apply_motion_quality_filter(channel: RetargetChannel) -> RetargetChannel:
     if channel.path != "rotation":
         return channel
@@ -902,7 +1216,7 @@ def _motion_quality_diagnostics_metadata(channels: list[RetargetChannel]) -> dic
 def _motion_quality_left_right_summary(entries: list[dict[str, object]]) -> dict[str, object]:
     by_role = {str(entry.get("role")): entry for entry in entries}
     summary = {}
-    for suffix in ("shoulder", "upper_arm", "forearm", "hand"):
+    for suffix in ("shoulder", "upper_arm", "forearm", "hand", "upper_leg", "lower_leg", "foot"):
         left = by_role.get(f"left_{suffix}")
         right = by_role.get(f"right_{suffix}")
         if left is None or right is None:
@@ -938,6 +1252,22 @@ def _max_quaternion_frame_jump_degrees(values: tuple[tuple[float, ...], ...]) ->
 
 
 def _motion_quality_settings_for_role(role: str) -> tuple[float, float] | None:
+    if role == "hips":
+        return (45.0, 12.0)
+    if role == "spine":
+        return (35.0, 10.0)
+    if role == "chest":
+        return (45.0, 12.0)
+    if role == "neck":
+        return (35.0, 12.0)
+    if role == "head":
+        return (45.0, 16.0)
+    if role.endswith("_foot"):
+        return (70.0, 14.0)
+    if role.endswith("_lower_leg"):
+        return (125.0, 18.0)
+    if role.endswith("_upper_leg"):
+        return (110.0, 20.0)
     if role.endswith("_hand"):
         return (65.0, 12.0)
     if role.endswith("_forearm") or role.endswith("_lower_arm"):
@@ -1209,6 +1539,61 @@ def _normalize_quaternion_xyzw(quaternion: tuple[float, float, float, float]) ->
 
 def _unique_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _locomotion_policy_for_context(motion_context: MotionContext | None, *, frame_count: int, fallback_mode: str) -> dict[str, object]:
+    if motion_context is None:
+        return {
+            "mode": fallback_mode,
+            "source": "none",
+            "detected_locomotion": False,
+            "root_horizontal_range": 0.0,
+            "root_displacement": [0.0, 0.0, 0.0],
+            "foot_contact_shape": [],
+            "foot_contact_ratio": 0.0,
+            "warnings": ["motion_context_unavailable"],
+            "deferred": ["contact_aware_foot_locking"],
+        }
+    return motion_context.locomotion_policy(frame_count=frame_count, fallback_mode=fallback_mode)
+
+
+def _array_to_tuple(value: object) -> tuple[tuple[float, ...], ...]:
+    try:
+        return tuple(tuple(float(component) for component in row) for row in value)  # type: ignore[union-attr]
+    except TypeError:
+        return ()
+
+
+def _valid_root_positions(value: tuple[tuple[float, ...], ...] | None) -> bool:
+    return bool(value) and all(len(sample) == 3 for sample in value)
+
+
+def _invalid_root_position_warnings(context: MotionContext) -> list[str]:
+    warnings = []
+    if "smooth_root_pos" in context.source_keys and not _valid_root_positions(context.smooth_root_pos):
+        warnings.append("invalid_smooth_root_pos_shape")
+    if "root_positions" in context.source_keys and not _valid_root_positions(context.root_positions):
+        warnings.append("invalid_root_positions_shape")
+    if "smooth_root_pos" not in context.source_keys and "root_positions" not in context.source_keys:
+        warnings.append("root_positions_unavailable")
+    return warnings
+
+
+def _array_shape(value: tuple[tuple[float, ...], ...] | None) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if not value:
+        return (0,)
+    return (len(value), len(value[0]))
+
+
+def _clean_float(value: float) -> float:
+    cleaned = round(float(value), 10)
+    return 0.0 if abs(cleaned) < 1e-10 else cleaned
+
+
+def _unique_list(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
 
 
 def _root_motion_target(source: BvhMotion, mapping: JointMapping) -> str | None:

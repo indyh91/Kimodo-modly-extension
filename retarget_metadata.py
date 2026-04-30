@@ -42,6 +42,7 @@ def retarget_success_metadata(
     calibration = getattr(clip, "calibration", {}) or {}
     if calibration:
         merged_diagnostics["retarget_calibration"] = calibration
+    top_level_calibration = calibration if calibration.get("version") else None
     return {
         "retarget_status": "success",
         "retarget_error_code": None,
@@ -56,7 +57,7 @@ def retarget_success_metadata(
         "warnings": list(warnings),
         "diagnostics": merged_diagnostics,
         "humanoid_contract": humanoid_contract,
-        "retarget_calibration": calibration or None,
+        "retarget_calibration": top_level_calibration,
     }
 
 

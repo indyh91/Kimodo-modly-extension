@@ -19,7 +19,7 @@ from glb_animation_exporter import GlbAnimationExporter
 from kimodo_bvh import locate_bvh, parse_bvh
 from retarget_errors import RetargetError
 from retarget_metadata import _humanoid_contract_metadata, retarget_failure_metadata, retarget_success_metadata
-from retargeting import build_retarget_clip
+from retargeting import build_retarget_clip, load_motion_context
 from rig_inspector import inspect_rig
 
 try:
@@ -552,6 +552,22 @@ def find_primary_npz(bundle_dir: Path, output_stem_name: str, num_samples: int) 
     )
 
 
+def motion_context_npz_path(bundle_dir: Path, metadata_path: Path, completed: dict[str, Any]) -> Path | None:
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    canonical = payload.get("canonical_motion_artifact") if isinstance(payload, dict) else None
+    if isinstance(canonical, str) and canonical.strip():
+        candidate = bundle_dir / canonical
+        if candidate.is_file():
+            return candidate
+    try:
+        return find_primary_npz(bundle_dir, str(completed.get("output_stem_name") or "motion"), safe_int(completed.get("num_samples", 1)) or 1)
+    except KimodoRuntimeError:
+        return None
+
+
 def retarget_motion_bundle(
     bundle_dir: Path,
     metadata_path: Path,
@@ -580,7 +596,11 @@ def retarget_motion_bundle(
         humanoid_contract = _humanoid_contract_metadata(rig)
         if humanoid_contract:
             diagnostics["humanoid_contract"] = humanoid_contract
-        clip = build_retarget_clip(motion, rig)
+        motion_context_path = motion_context_npz_path(bundle_dir, metadata_path, completed)
+        motion_context = load_motion_context(motion_context_path)
+        if motion_context_path is not None:
+            diagnostics["motion_context_npz"] = str(motion_context_path)
+        clip = build_retarget_clip(motion, rig, motion_context=motion_context)
         diagnostics["mapping_confidence"] = clip.mapping.confidence
         animated_path = GlbAnimationExporter().write_animation(rig, clip, output_path)
         update_bundle_metadata(
