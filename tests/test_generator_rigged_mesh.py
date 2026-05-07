@@ -9,6 +9,8 @@ from unittest import mock
 
 import sys
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -150,6 +152,51 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         self.assertEqual(metadata["mapping_confidence"], "calibrated")
         self.assertEqual(metadata["retarget_calibration"]["chain_coverage"]["torso"], "5/5")
         self.assertEqual(metadata["diagnostics"]["humanoid_contract"]["diagnostics"], ["humanoid_contract_validated"])
+
+    def test_retarget_motion_bundle_enriches_visual_quality_after_export_without_blocking_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            metadata_path = bundle / "metadata.json"
+            metadata_path.write_text(json.dumps({"canonical_motion_artifact": "motion.npz"}), encoding="utf-8")
+            (bundle / "motion.bvh").write_text((FIXTURES / "synthetic_walk.bvh").read_text(encoding="utf-8"), encoding="utf-8")
+            np.savez(bundle / "motion.npz", foot_contacts=np.array([[1.0, 0.0], [1.0, 0.0]], dtype=float))
+            rig = FIXTURES / "tiny_rigged.gltf"
+            request = {"rigged_mesh_path": rig, "rigged_mesh_source_kind": "load_mesh_existing"}
+            completed = {"output_stem_name": "motion", "num_samples": 1}
+            calls = []
+
+            def fake_extract(path, humanoid_roles, *, expected_frame_count=None):
+                calls.append(("extract", Path(path).name, expected_frame_count, len(tuple(humanoid_roles))))
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "status": "success",
+                        "samples": {
+                            "left": ((0.0, 0.0, 0.0), (0.08, 0.0, 0.0)),
+                            "right": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                        },
+                        "reason": None,
+                        "details": {"frame_count": 2},
+                    },
+                )()
+
+            with mock.patch("generator.extract_world_foot_samples", side_effect=fake_extract):
+                animated = generator.retarget_motion_bundle(bundle, metadata_path, request, completed)
+
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(animated.name, "animated.glb")
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["visual_quality_status"], "warning")
+        self.assertIn("visual_quality/foot_contact_slide", metadata["warnings"])
+        foot_contact = metadata["diagnostics"]["visual_quality"]["checks"]["foot_contact"]
+        self.assertEqual(foot_contact["confidence"], "measured")
+        self.assertEqual(foot_contact["measurement_space"], "world")
+        self.assertEqual(foot_contact["measurement_target"], "node_origin")
+        self.assertEqual(calls[0][0], "extract")
+        self.assertEqual(calls[0][1], "animated.glb")
+        self.assertEqual(calls[0][2], 2)
 
     def test_generate_animate_rigged_mesh_reports_humanoid_contract_failure_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -916,6 +916,57 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(foot_contact["confidence"], "measured")
         self.assertAlmostEqual(foot_contact["max_slide"], 0.12)
 
+    def test_visual_quality_measured_foot_contact_records_world_node_origin_metadata(self):
+        contacts = ((1.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+        foot_samples = {
+            "left": ((0.0, 0.0, 0.0), (0.01, 0.0, 0.0), (0.25, 0.0, 0.0)),
+            "right": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.02, 0.0, 0.0)),
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=0.1,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        diagnostics = visual_quality_diagnostics(clip, foot_contacts=contacts, world_foot_samples=foot_samples, foot_slide_threshold=0.05)
+
+        foot_contact = diagnostics["checks"]["foot_contact"]
+        self.assertEqual(foot_contact["confidence"], "measured")
+        self.assertEqual(foot_contact["measurement_space"], "world")
+        self.assertEqual(foot_contact["measurement_target"], "node_origin")
+        self.assertEqual(foot_contact["contact_windows"], {"left": [[0, 1]], "right": [[2, 2]]})
+        self.assertEqual(foot_contact["threshold"], 0.05)
+        self.assertIn("v1 measures foot node-origin stance slide, not physical sole contact.", diagnostics["limitations"])
+
+    def test_visual_quality_not_evaluated_preserves_extraction_reason_without_measured_confidence(self):
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=0.1,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        diagnostics = visual_quality_diagnostics(
+            clip,
+            foot_contacts=((1.0, 0.0), (0.0, 1.0)),
+            world_foot_samples=None,
+            world_foot_sample_details={"status": "not_evaluated", "reason": "unsupported_interpolation:CUBICSPLINE", "details": {"interpolation": "CUBICSPLINE"}},
+        )
+
+        foot_contact = diagnostics["checks"]["foot_contact"]
+        self.assertEqual(foot_contact["status"], "not_evaluated")
+        self.assertEqual(foot_contact["confidence"], "not_evaluated")
+        self.assertEqual(foot_contact["reason"], "unsupported_interpolation:CUBICSPLINE")
+        self.assertEqual(foot_contact["details"], {"interpolation": "CUBICSPLINE"})
+        self.assertNotIn("visual_quality/foot_contact_slide", diagnostics["warnings"])
+
     def test_visual_quality_foot_contact_proxy_only_and_missing_contacts_never_claim_slide(self):
         clip = RetargetClip(
             name="Kimodo Motion",

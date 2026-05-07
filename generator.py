@@ -10,16 +10,18 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from host_compat import EXPERIMENTAL, UNSUPPORTED, resolve_host_compatibility
 from glb_animation_exporter import GlbAnimationExporter
+from glb_world_space import extract_world_foot_samples
 from kimodo_bvh import locate_bvh, parse_bvh
 from retarget_errors import RetargetError
 from retarget_metadata import _humanoid_contract_metadata, retarget_failure_metadata, retarget_success_metadata
-from retargeting import build_retarget_clip, load_motion_context
+from retargeting import build_retarget_clip, load_motion_context, visual_quality_diagnostics
 from rig_inspector import inspect_rig
 
 try:
@@ -603,6 +605,7 @@ def retarget_motion_bundle(
         clip = build_retarget_clip(motion, rig, motion_context=motion_context)
         diagnostics["mapping_confidence"] = clip.mapping.confidence
         animated_path = GlbAnimationExporter().write_animation(rig, clip, output_path)
+        clip = _enrich_visual_quality_after_export(animated_path, rig, clip, motion_context, diagnostics)
         update_bundle_metadata(
             metadata_path,
             retarget_success_metadata(animated_path, rig=rig, clip=clip, warnings=clip.warnings, diagnostics=diagnostics),
@@ -619,6 +622,31 @@ def retarget_motion_bundle(
             exc.code,
             f"Animate Rigged Mesh could not produce a real animated GLB: {exc.message}. Metadata was written to {metadata_path}.",
         ) from exc
+
+
+def _enrich_visual_quality_after_export(animated_path: Path, rig: Any, clip: Any, motion_context: Any, diagnostics: dict[str, Any]) -> Any:
+    """Enrich visual diagnostics from exported GLB without changing export success."""
+
+    try:
+        expected_frame_count = len(motion_context.foot_contacts) if motion_context is not None and motion_context.foot_contacts is not None else None
+        extraction = extract_world_foot_samples(animated_path, getattr(rig, "humanoid_roles", ()), expected_frame_count=expected_frame_count)
+        diagnostics["world_space_foot_samples"] = {
+            "status": extraction.status,
+            "reason": extraction.reason,
+            "details": extraction.details,
+        }
+        samples = extraction.samples if extraction.status == "success" else None
+        details = {"status": extraction.status, "reason": extraction.reason, "details": extraction.details}
+        visual_quality = visual_quality_diagnostics(
+            clip,
+            motion_context=motion_context,
+            world_foot_samples=samples,
+            world_foot_sample_details=details,
+        )
+        return replace(clip, visual_quality=visual_quality)
+    except Exception as exc:  # noqa: BLE001 - post-export diagnostics must never block success
+        diagnostics["world_space_foot_samples"] = {"status": "not_evaluated", "reason": "metrics_exception", "details": {"error": f"{type(exc).__name__}: {exc}"}}
+        return clip
 
 
 def update_bundle_metadata(metadata_path: Path, updates: dict[str, Any], *, bundle_dir: Path | None = None) -> None:

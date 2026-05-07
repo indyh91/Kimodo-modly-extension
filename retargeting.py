@@ -1029,6 +1029,7 @@ def apply_contact_aware_foot_locking(
 
 VISUAL_QUALITY_VERSION = "kimodo.visual_quality.v1"
 VISUAL_QUALITY_LIMITATION = "Diagnostics do not prove visual success."
+FOOT_NODE_ORIGIN_LIMITATION = "v1 measures foot node-origin stance slide, not physical sole contact."
 
 
 def visual_quality_diagnostics(
@@ -1037,6 +1038,7 @@ def visual_quality_diagnostics(
     motion_context: MotionContext | None = None,
     foot_contacts: tuple[tuple[float, ...], ...] | None = None,
     world_foot_samples: dict[str, tuple[tuple[float, float, float], ...]] | None = None,
+    world_foot_sample_details: dict[str, object] | None = None,
     source_euler_degrees: dict[str, tuple[float, ...]] | None = None,
     foot_slide_threshold: float = 0.05,
 ) -> dict[str, object]:
@@ -1059,8 +1061,11 @@ def visual_quality_diagnostics(
     foot_contact = _visual_foot_contact_check(
         contacts,
         world_foot_samples=world_foot_samples,
+        world_foot_sample_details=world_foot_sample_details,
         slide_threshold=foot_slide_threshold,
     )
+    if foot_contact.get("confidence") == "measured":
+        limitations.append(FOOT_NODE_ORIGIN_LIMITATION)
     for code in foot_contact.get("warnings", []):
         warnings.append(str(code))
     euler_advisories = _euler_wrap_advisories(source_euler_degrees or {}, angular_checks)
@@ -1176,6 +1181,7 @@ def _visual_foot_contact_check(
     foot_contacts: tuple[tuple[float, ...], ...] | None,
     *,
     world_foot_samples: dict[str, tuple[tuple[float, float, float], ...]] | None,
+    world_foot_sample_details: dict[str, object] | None,
     slide_threshold: float,
 ) -> dict[str, object]:
     if not foot_contacts:
@@ -1187,6 +1193,19 @@ def _visual_foot_contact_check(
         }
     shape = _array_shape(foot_contacts)
     if world_foot_samples is None:
+        if isinstance(world_foot_sample_details, dict) and world_foot_sample_details.get("status") == "not_evaluated":
+            check = {
+                "status": "not_evaluated",
+                "confidence": "not_evaluated",
+                "reason": str(world_foot_sample_details.get("reason") or "world_space_foot_samples_unavailable"),
+                "contact_shape": list(shape),
+                "contact_ratio": _clean_float(_contact_ratio(foot_contacts)),
+                "warnings": ["visual_quality/foot_contact_not_evaluated"],
+            }
+            details = world_foot_sample_details.get("details")
+            if isinstance(details, dict):
+                check["details"] = details
+            return check
         return {
             "status": "not_evaluated",
             "confidence": "proxy_only",
@@ -1209,6 +1228,8 @@ def _visual_foot_contact_check(
     return {
         "status": "warning" if warnings else "ok",
         "confidence": "measured",
+        "measurement_space": "world",
+        "measurement_target": "node_origin",
         "contact_shape": slide["contact_shape"],
         "contact_ratio": slide["contact_ratio"],
         "contact_windows": {"left": slide["left"]["windows"], "right": slide["right"]["windows"]},
