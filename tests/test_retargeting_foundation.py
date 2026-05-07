@@ -3,6 +3,7 @@ import math
 import struct
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import sys
@@ -24,6 +25,7 @@ from retargeting import (  # noqa: E402
     apply_contact_aware_foot_locking,
     foot_trajectory_diagnostics,
     stance_foot_slide_diagnostics,
+    visual_quality_diagnostics,
     _motion_quality_settings_for_role,
     _target_basis_child_role,
     build_joint_mapping,
@@ -790,6 +792,230 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(diagnostics["status"], "applied")
         self.assertLess(diagnostics["post"]["summary"]["max_slide"], diagnostics["pre"]["summary"]["max_slide"])
 
+    def test_visual_quality_angular_velocity_uses_hemisphere_continuity_and_role_thresholds(self):
+        foot_channel = RetargetChannel(
+            target_joint="LeftFoot",
+            path="rotation",
+            times=(0.0, 1.0 / 30.0, 2.0 / 30.0),
+            values=(
+                self._axis_angle_quaternion_x(0.0),
+                tuple(-component for component in self._axis_angle_quaternion_x(10.0)),
+                self._axis_angle_quaternion_x(90.0),
+            ),
+            diagnostics={"role": "left_foot"},
+        )
+        arm_channel = RetargetChannel(
+            target_joint="LeftUpperArm",
+            path="rotation",
+            times=(0.0, 1.0 / 30.0, 2.0 / 30.0),
+            values=(self._axis_angle_quaternion_x(0.0), self._axis_angle_quaternion_x(70.0), self._axis_angle_quaternion_x(120.0)),
+            diagnostics={"role": "left_upper_arm"},
+        )
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=2.0 / 30.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(foot_channel, arm_channel),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        diagnostics = visual_quality_diagnostics(clip)
+
+        self.assertEqual(diagnostics["version"], "kimodo.visual_quality.v1")
+        self.assertFalse(diagnostics["blocking"])
+        self.assertEqual(diagnostics["status"], "warning")
+        self.assertIn("visual_quality/leg_angular_velocity_spike", diagnostics["warnings"])
+        self.assertNotIn("visual_quality/arm_angular_velocity_spike", diagnostics["warnings"])
+        angular_by_role = {entry["role"]: entry for entry in diagnostics["checks"]["angular_velocity"]}
+        self.assertAlmostEqual(angular_by_role["left_foot"]["max_deg_s"], 2400.0, delta=1e-6)
+        self.assertAlmostEqual(angular_by_role["left_foot"]["p95_deg_s"], 2400.0, delta=1e-6)
+        self.assertEqual(angular_by_role["left_foot"]["threshold_deg_s"], 420.0)
+        self.assertEqual(angular_by_role["left_foot"]["spike_count"], 1)
+        self.assertEqual(angular_by_role["left_foot"]["frames"], [2])
+        self.assertEqual(angular_by_role["left_upper_arm"]["spike_count"], 0)
+
+    def test_visual_quality_reports_arm_angular_velocity_spikes_separately_from_leg_spikes(self):
+        arm_channel = RetargetChannel(
+            target_joint="RightHand",
+            path="rotation",
+            times=(0.0, 1.0 / 30.0, 2.0 / 30.0),
+            values=(self._axis_angle_quaternion_x(0.0), self._axis_angle_quaternion_x(10.0), self._axis_angle_quaternion_x(40.0)),
+            diagnostics={"role": "right_hand"},
+        )
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=2.0 / 30.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(arm_channel,),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        diagnostics = visual_quality_diagnostics(clip)
+
+        self.assertEqual(diagnostics["status"], "warning")
+        self.assertIn("visual_quality/arm_angular_velocity_spike", diagnostics["warnings"])
+        self.assertNotIn("visual_quality/leg_angular_velocity_spike", diagnostics["warnings"])
+        angular = diagnostics["checks"]["angular_velocity"][0]
+        self.assertEqual(angular["role"], "right_hand")
+        self.assertEqual(angular["frames"], [2])
+        self.assertEqual(angular["threshold_deg_s"], 360.0)
+
+    def test_visual_quality_records_bvh_euler_wrap_as_advisory_when_quaternion_continuity_is_ok(self):
+        channel = RetargetChannel(
+            target_joint="LeftUpperArm",
+            path="rotation",
+            times=(0.0, 1.0 / 30.0, 2.0 / 30.0),
+            values=(self._axis_angle_quaternion_x(0.0), self._axis_angle_quaternion_x(5.0), self._axis_angle_quaternion_x(8.0)),
+            diagnostics={"role": "left_upper_arm"},
+        )
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=2.0 / 30.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(channel,),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        diagnostics = visual_quality_diagnostics(clip, source_euler_degrees={"left_upper_arm": (170.0, -175.0, 178.0)})
+
+        self.assertEqual(diagnostics["status"], "not_evaluated")
+        self.assertIn("euler_wrap_advisory", diagnostics["checks"])
+        advisory = diagnostics["checks"]["euler_wrap_advisory"][0]
+        self.assertEqual(advisory["role"], "left_upper_arm")
+        self.assertEqual(advisory["status"], "advisory")
+        self.assertNotIn("visual_quality/arm_angular_velocity_spike", diagnostics["warnings"])
+
+    def test_visual_quality_foot_contact_measured_slide_requires_world_space_samples(self):
+        contacts = ((1.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 1.0))
+        foot_samples = {
+            "left": ((0.0, 0.0, 0.0), (0.08, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            "right": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.12, 0.0, 0.0)),
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=0.1,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        diagnostics = visual_quality_diagnostics(clip, foot_contacts=contacts, world_foot_samples=foot_samples, foot_slide_threshold=0.05)
+
+        self.assertEqual(diagnostics["status"], "warning")
+        self.assertIn("visual_quality/foot_contact_slide", diagnostics["warnings"])
+        foot_contact = diagnostics["checks"]["foot_contact"]
+        self.assertEqual(foot_contact["status"], "warning")
+        self.assertEqual(foot_contact["confidence"], "measured")
+        self.assertAlmostEqual(foot_contact["max_slide"], 0.12)
+
+    def test_visual_quality_foot_contact_proxy_only_and_missing_contacts_never_claim_slide(self):
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=0.1,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+        )
+
+        proxy_only = visual_quality_diagnostics(clip, foot_contacts=((1.0, 0.0), (0.0, 1.0)))
+        missing = visual_quality_diagnostics(clip)
+
+        self.assertEqual(proxy_only["checks"]["foot_contact"]["confidence"], "proxy_only")
+        self.assertEqual(proxy_only["checks"]["foot_contact"]["status"], "not_evaluated")
+        self.assertIn("visual_quality/foot_contact_proxy_only", proxy_only["warnings"])
+        self.assertNotIn("visual_quality/foot_contact_slide", proxy_only["warnings"])
+        self.assertEqual(missing["checks"]["foot_contact"]["confidence"], "not_evaluated")
+        self.assertEqual(missing["checks"]["foot_contact"]["reason"], "missing_contact_data")
+        self.assertIn("visual_quality/foot_contact_not_evaluated", missing["warnings"])
+
+    def test_visual_quality_clean_measured_metrics_report_ok_without_visual_warning_metadata(self):
+        channel = RetargetChannel(
+            target_joint="LeftFoot",
+            path="rotation",
+            times=(0.0, 1.0 / 30.0, 2.0 / 30.0),
+            values=(
+                self._axis_angle_quaternion_x(0.0),
+                self._axis_angle_quaternion_x(3.0),
+                self._axis_angle_quaternion_x(6.0),
+            ),
+            diagnostics={"role": "left_foot"},
+        )
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=2.0 / 30.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(channel,),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=("existing_warning",),
+        )
+        contacts = ((1.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+        foot_samples = {
+            "left": ((0.0, 0.0, 0.0), (0.01, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            "right": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.02, 0.0, 0.0)),
+        }
+
+        visual_quality = visual_quality_diagnostics(
+            clip,
+            foot_contacts=contacts,
+            world_foot_samples=foot_samples,
+            foot_slide_threshold=0.05,
+        )
+        metadata = retarget_success_metadata(
+            Path("animated.glb"),
+            rig=object(),
+            clip=RetargetClip(
+                name=clip.name,
+                duration=clip.duration,
+                frame_time=clip.frame_time,
+                root_translations=clip.root_translations,
+                channels=clip.channels,
+                mapping=clip.mapping,
+                warnings=clip.warnings,
+                visual_quality=visual_quality,
+            ),
+            warnings=clip.warnings,
+        )
+
+        self.assertEqual(visual_quality["status"], "ok")
+        self.assertEqual(visual_quality["warnings"], [])
+        self.assertEqual(visual_quality["checks"]["foot_contact"]["confidence"], "measured")
+        self.assertEqual(visual_quality["checks"]["foot_contact"]["status"], "ok")
+        self.assertEqual(visual_quality["checks"]["angular_velocity"][0]["spike_count"], 0)
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["visual_quality_status"], "ok")
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["status"], "ok")
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["version"], "kimodo.visual_quality.v1")
+        self.assertNotIn("visual_quality_warning", metadata["warnings"])
+        self.assertEqual(metadata["warnings"], ["existing_warning"])
+
+    def test_visual_quality_metric_exception_degrades_to_not_evaluated_without_retarget_error(self):
+        motion = parse_bvh(FIXTURES / "synthetic_walk.bvh")
+        rig = inspect_rig(FIXTURES / "tiny_rigged.gltf")
+
+        with mock.patch("retargeting.visual_quality_diagnostics", side_effect=RuntimeError("metric boom")):
+            clip = build_retarget_clip(motion, rig)
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=rig, clip=clip, warnings=clip.warnings)
+
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["visual_quality_status"], "not_evaluated")
+        self.assertIn("visual_quality_warning", metadata["warnings"])
+        self.assertIn("visual_quality/metrics_not_evaluated", metadata["warnings"])
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["status"], "not_evaluated")
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["checks"]["foot_contact"]["reason"], "metrics_exception")
+        self.assertIn("RuntimeError: metric boom", metadata["diagnostics"]["visual_quality"]["reason"])
+
     def test_leg_basis_child_roles_use_knee_to_foot_axis_without_affecting_arms(self):
         self.assertEqual(_target_basis_child_role("left_lower_leg"), "left_foot")
         self.assertEqual(_target_basis_child_role("right_lower_leg"), "right_foot")
@@ -970,6 +1196,67 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(diagnostics["motion_quality_filter"], "role_aware_conservative")
         self.assertEqual(top_level["motion_quality_filter"], "role_aware_conservative")
         self.assertGreater(len(diagnostics["channels"]), 0)
+
+    def test_visual_quality_success_metadata_is_additive_non_blocking_and_namespaced(self):
+        visual_quality = {
+            "version": "kimodo.visual_quality.v1",
+            "blocking": False,
+            "status": "warning",
+            "warnings": ["visual_quality/leg_angular_velocity_spike"],
+            "limitations": ["Diagnostics do not prove visual success."],
+            "checks": {"angular_velocity": [{"role": "left_foot", "max_deg_s": 900.0}]},
+            "summary": {"warning_count": 1},
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=1.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=("existing_warning",),
+            visual_quality=visual_quality,
+        )
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=object(), clip=clip, warnings=clip.warnings)
+
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["visual_quality_status"], "warning")
+        self.assertIn("existing_warning", metadata["warnings"])
+        self.assertIn("visual_quality_warning", metadata["warnings"])
+        self.assertIn("visual_quality/leg_angular_velocity_spike", metadata["warnings"])
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["version"], "kimodo.visual_quality.v1")
+        self.assertFalse(metadata["diagnostics"]["visual_quality"]["blocking"])
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["limitations"], ["Diagnostics do not prove visual success."])
+
+    def test_visual_quality_not_evaluated_success_metadata_does_not_claim_visual_success(self):
+        visual_quality = {
+            "version": "kimodo.visual_quality.v1",
+            "blocking": False,
+            "status": "not_evaluated",
+            "warnings": ["visual_quality/foot_contact_not_evaluated"],
+            "limitations": ["Diagnostics do not prove visual success."],
+            "checks": {"foot_contact": {"status": "not_evaluated", "reason": "missing_contact_data"}},
+            "summary": {"warning_count": 1},
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=1.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=(),
+            visual_quality=visual_quality,
+        )
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=object(), clip=clip, warnings=clip.warnings)
+
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["visual_quality_status"], "not_evaluated")
+        self.assertIn("visual_quality_warning", metadata["warnings"])
+        self.assertIn("visual_quality/foot_contact_not_evaluated", metadata["warnings"])
+        self.assertNotEqual(metadata["visual_quality_status"], "ok")
 
     def test_locomotion_policy_survives_success_metadata_integration(self):
         with tempfile.TemporaryDirectory() as tmp:

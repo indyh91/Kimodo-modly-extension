@@ -124,6 +124,7 @@ class RetargetClip:
     mapping: JointMapping
     warnings: tuple[str, ...]
     calibration: dict[str, object] = field(default_factory=dict)
+    visual_quality: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -354,7 +355,7 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
         if motion_quality_diagnostics is not None:
             calibration["motion_quality_filter"] = motion_quality_diagnostics["motion_quality_filter"]
             calibration["motion_quality_diagnostics"] = motion_quality_diagnostics
-    return RetargetClip(
+    clip = RetargetClip(
         name="Kimodo Motion",
         duration=source.duration,
         frame_time=source.frame_time,
@@ -363,6 +364,17 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
         mapping=mapping,
         warnings=warnings,
         calibration=calibration,
+    )
+    return RetargetClip(
+        name=clip.name,
+        duration=clip.duration,
+        frame_time=clip.frame_time,
+        root_translations=clip.root_translations,
+        channels=clip.channels,
+        mapping=clip.mapping,
+        warnings=clip.warnings,
+        calibration=clip.calibration,
+        visual_quality=_safe_visual_quality_diagnostics(clip, motion_context=motion_context),
     )
 
 
@@ -1013,6 +1025,214 @@ def apply_contact_aware_foot_locking(
         "deferred": ["world_space_leg_ik"],
     }
     return locked, diagnostics
+
+
+VISUAL_QUALITY_VERSION = "kimodo.visual_quality.v1"
+VISUAL_QUALITY_LIMITATION = "Diagnostics do not prove visual success."
+
+
+def visual_quality_diagnostics(
+    clip: RetargetClip,
+    *,
+    motion_context: MotionContext | None = None,
+    foot_contacts: tuple[tuple[float, ...], ...] | None = None,
+    world_foot_samples: dict[str, tuple[tuple[float, float, float], ...]] | None = None,
+    source_euler_degrees: dict[str, tuple[float, ...]] | None = None,
+    foot_slide_threshold: float = 0.05,
+) -> dict[str, object]:
+    """Compute warning-only visual-quality diagnostics for a retarget clip.
+
+    This function is intentionally diagnostics-only. It never mutates animation
+    samples, never applies IK/foot locking, and its output is additive metadata.
+    """
+
+    contacts = foot_contacts if foot_contacts is not None else (motion_context.foot_contacts if motion_context is not None else None)
+    warnings: list[str] = []
+    limitations = [VISUAL_QUALITY_LIMITATION]
+    angular_checks = _angular_velocity_checks(clip)
+    for check in angular_checks:
+        if int(check["spike_count"] or 0) <= 0:
+            continue
+        code = _angular_warning_code(str(check.get("role") or ""))
+        if code:
+            warnings.append(code)
+    foot_contact = _visual_foot_contact_check(
+        contacts,
+        world_foot_samples=world_foot_samples,
+        slide_threshold=foot_slide_threshold,
+    )
+    for code in foot_contact.get("warnings", []):
+        warnings.append(str(code))
+    euler_advisories = _euler_wrap_advisories(source_euler_degrees or {}, angular_checks)
+    namespaced_warnings = _unique_list(warnings)
+    status = "warning" if any(code not in {"visual_quality/foot_contact_proxy_only", "visual_quality/foot_contact_not_evaluated"} for code in namespaced_warnings) else "not_evaluated"
+    if not namespaced_warnings and angular_checks and foot_contact.get("confidence") == "measured":
+        status = "ok"
+    checks: dict[str, object] = {
+        "angular_velocity": angular_checks,
+        "foot_contact": {key: value for key, value in foot_contact.items() if key != "warnings"},
+    }
+    if euler_advisories:
+        checks["euler_wrap_advisory"] = euler_advisories
+    return {
+        "version": VISUAL_QUALITY_VERSION,
+        "blocking": False,
+        "status": status,
+        "warnings": namespaced_warnings,
+        "limitations": limitations,
+        "summary": {
+            "warning_count": len(namespaced_warnings),
+            "angular_channel_count": len(angular_checks),
+            "foot_contact_confidence": foot_contact.get("confidence"),
+        },
+        "checks": checks,
+    }
+
+
+def _safe_visual_quality_diagnostics(clip: RetargetClip, *, motion_context: MotionContext | None) -> dict[str, object]:
+    try:
+        return visual_quality_diagnostics(clip, motion_context=motion_context)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never block export
+        return {
+            "version": VISUAL_QUALITY_VERSION,
+            "blocking": False,
+            "status": "not_evaluated",
+            "warnings": ["visual_quality/metrics_not_evaluated"],
+            "limitations": [VISUAL_QUALITY_LIMITATION],
+            "summary": {"warning_count": 1, "foot_contact_confidence": "not_evaluated"},
+            "checks": {
+                "angular_velocity": [],
+                "foot_contact": {"status": "not_evaluated", "confidence": "not_evaluated", "reason": "metrics_exception"},
+            },
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _angular_velocity_checks(clip: RetargetClip) -> list[dict[str, object]]:
+    checks: list[dict[str, object]] = []
+    frame_time = float(getattr(clip, "frame_time", 0.0) or 0.0)
+    if frame_time <= 0.0:
+        return checks
+    for channel in clip.channels:
+        if channel.path != "rotation" or len(channel.values) < 2:
+            continue
+        role = str(channel.diagnostics.get("role") or "")
+        threshold = _visual_angular_threshold_for_role(role)
+        if threshold is None:
+            continue
+        velocities = _quaternion_angular_velocities_deg_s(channel.values, frame_time)
+        spike_frames = [index + 1 for index, value in enumerate(velocities) if value > threshold]
+        checks.append(
+            {
+                "role": role,
+                "target_joint": channel.target_joint,
+                "unit": "deg/s",
+                "threshold_deg_s": _clean_float(threshold),
+                "max_deg_s": _clean_float(max(velocities) if velocities else 0.0),
+                "p95_deg_s": _clean_float(_percentile95(velocities)),
+                "spike_count": len(spike_frames),
+                "frames": spike_frames,
+            }
+        )
+    return checks
+
+
+def _quaternion_angular_velocities_deg_s(values: tuple[tuple[float, ...], ...], frame_time: float) -> list[float]:
+    normalized = [_normalize_quaternion_xyzw(tuple(float(component) for component in value)) for value in values]
+    continuous = [normalized[0]]
+    for value in normalized[1:]:
+        continuous.append(_same_hemisphere_quaternion(value, continuous[-1]))
+    velocities = []
+    for index in range(1, len(continuous)):
+        delta = _multiply_quaternion_xyzw(continuous[index], _inverse_quaternion_xyzw(continuous[index - 1]))
+        velocities.append(math.degrees(_quaternion_angle_radians(_normalize_quaternion_xyzw(delta))) / frame_time)
+    return velocities
+
+
+def _visual_angular_threshold_for_role(role: str) -> float | None:
+    settings = _motion_quality_settings_for_role(role)
+    if settings is None:
+        return None
+    return float(settings[1]) * 30.0
+
+
+def _angular_warning_code(role: str) -> str | None:
+    if any(part in role for part in ("leg", "foot")):
+        return "visual_quality/leg_angular_velocity_spike"
+    if any(part in role for part in ("arm", "forearm", "hand", "shoulder")):
+        return "visual_quality/arm_angular_velocity_spike"
+    return None
+
+
+def _percentile95(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return ordered[index]
+
+
+def _visual_foot_contact_check(
+    foot_contacts: tuple[tuple[float, ...], ...] | None,
+    *,
+    world_foot_samples: dict[str, tuple[tuple[float, float, float], ...]] | None,
+    slide_threshold: float,
+) -> dict[str, object]:
+    if not foot_contacts:
+        return {
+            "status": "not_evaluated",
+            "confidence": "not_evaluated",
+            "reason": "missing_contact_data",
+            "warnings": ["visual_quality/foot_contact_not_evaluated"],
+        }
+    shape = _array_shape(foot_contacts)
+    if world_foot_samples is None:
+        return {
+            "status": "not_evaluated",
+            "confidence": "proxy_only",
+            "reason": "world_space_foot_samples_unavailable",
+            "contact_shape": list(shape),
+            "contact_ratio": _clean_float(_contact_ratio(foot_contacts)),
+            "warnings": ["visual_quality/foot_contact_proxy_only"],
+        }
+    if any(len(samples) != len(foot_contacts) for samples in world_foot_samples.values()):
+        return {
+            "status": "not_evaluated",
+            "confidence": "not_evaluated",
+            "reason": "foot_samples_contact_frame_count_mismatch",
+            "contact_shape": list(shape),
+            "warnings": ["visual_quality/foot_contact_not_evaluated"],
+        }
+    slide = stance_foot_slide_diagnostics(world_foot_samples, foot_contacts)
+    max_slide = float(slide["summary"]["max_slide"])
+    warnings = ["visual_quality/foot_contact_slide"] if max_slide > slide_threshold else []
+    return {
+        "status": "warning" if warnings else "ok",
+        "confidence": "measured",
+        "contact_shape": slide["contact_shape"],
+        "contact_ratio": slide["contact_ratio"],
+        "contact_windows": {"left": slide["left"]["windows"], "right": slide["right"]["windows"]},
+        "max_slide": _clean_float(max_slide),
+        "threshold": slide_threshold,
+        "warnings": warnings,
+    }
+
+
+def _euler_wrap_advisories(source_euler_degrees: dict[str, tuple[float, ...]], angular_checks: list[dict[str, object]]) -> list[dict[str, object]]:
+    by_role = {str(check.get("role")): check for check in angular_checks}
+    advisories: list[dict[str, object]] = []
+    for role, samples in source_euler_degrees.items():
+        if not _has_euler_wrap(samples):
+            continue
+        check = by_role.get(role)
+        if check is not None and int(check.get("spike_count") or 0) > 0:
+            continue
+        advisories.append({"role": role, "status": "advisory", "reason": "source_euler_wrap_with_acceptable_quaternion_continuity"})
+    return advisories
+
+
+def _has_euler_wrap(samples: tuple[float, ...]) -> bool:
+    return any(abs(float(samples[index]) - float(samples[index - 1])) >= 180.0 for index in range(1, len(samples)))
 
 
 def _trajectory_axis_metrics(samples: tuple[tuple[float, float, float], ...]) -> dict[str, object]:

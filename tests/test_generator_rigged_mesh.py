@@ -105,6 +105,11 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
             validation_report = validate_bundle(animated.parent)
 
         self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["visual_quality_status"], "not_evaluated")
+        self.assertIn("visual_quality_warning", metadata["warnings"])
+        self.assertIn("visual_quality/foot_contact_not_evaluated", metadata["warnings"])
+        self.assertEqual(metadata["diagnostics"]["visual_quality"]["version"], "kimodo.visual_quality.v1")
+        self.assertFalse(metadata["diagnostics"]["visual_quality"]["blocking"])
         self.assertIsNone(metadata["retarget_error_code"])
         self.assertIsNone(metadata["retarget_error_message"])
         self.assertEqual(metadata["retarget_error_aliases"], [])

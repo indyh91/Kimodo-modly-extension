@@ -220,6 +220,30 @@ class AnimatedGlbValidatorTests(unittest.TestCase):
         self.assertTrue(report["retarget_calibration"]["numeric_checks_only"])
         self.assertEqual(report["retarget_calibration"]["chain_coverage"], {"left_arm": "3/3"})
 
+    def test_validator_keeps_visual_quality_diagnostics_warning_only_and_structural(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = self._bundle(Path(tmp), animated_suffix=".glb")
+            metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+            metadata["visual_quality_status"] = "warning"
+            metadata["warnings"] = ["visual_quality_warning", "visual_quality/leg_angular_velocity_spike"]
+            metadata["diagnostics"] = {
+                "visual_quality": {
+                    "version": "kimodo.visual_quality.v1",
+                    "blocking": False,
+                    "status": "warning",
+                    "checks": {"angular_velocity": [{"role": "left_foot", "max_deg_s": 900.0}]},
+                    "limitations": ["Diagnostics do not prove visual success."],
+                }
+            }
+            (bundle / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+            report = validate_bundle(bundle)
+
+        self.assertTrue(report["passed"], report)
+        self.assertEqual(report["metadata"]["retarget_status"], "success")
+        self.assertIn("Structural validation only", report["limitations"][0])
+        self.assertNotIn("visual_quality", report["retarget_calibration"])
+
     def test_cli_writes_json_report_and_returns_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             bundle = self._bundle(Path(tmp), animated_suffix=".glb")

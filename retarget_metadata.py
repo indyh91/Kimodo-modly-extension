@@ -42,7 +42,12 @@ def retarget_success_metadata(
     calibration = getattr(clip, "calibration", {}) or {}
     if calibration:
         merged_diagnostics["retarget_calibration"] = calibration
+    visual_quality = _visual_quality_metadata(clip)
+    if visual_quality is not None:
+        merged_diagnostics["visual_quality"] = visual_quality
     top_level_calibration = calibration if calibration.get("version") else None
+    merged_warnings = _merge_success_warnings(warnings, visual_quality)
+    visual_quality_status = visual_quality.get("status") if isinstance(visual_quality, dict) else None
     return {
         "retarget_status": "success",
         "retarget_error_code": None,
@@ -54,11 +59,38 @@ def retarget_success_metadata(
         "classification": getattr(rig, "classification", "unknown"),
         "source_kind": getattr(rig, "source_kind", "unknown_mesh_source"),
         "mapping_confidence": getattr(mapping, "confidence", None),
-        "warnings": list(warnings),
+        "warnings": merged_warnings,
+        "visual_quality_status": visual_quality_status,
         "diagnostics": merged_diagnostics,
         "humanoid_contract": humanoid_contract,
         "retarget_calibration": top_level_calibration,
     }
+
+
+def _visual_quality_metadata(clip: Any) -> dict[str, Any] | None:
+    raw = getattr(clip, "visual_quality", None)
+    if not isinstance(raw, dict):
+        calibration = getattr(clip, "calibration", {}) or {}
+        raw = calibration.get("visual_quality") if isinstance(calibration, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    payload = dict(raw)
+    payload.setdefault("version", "kimodo.visual_quality.v1")
+    payload.setdefault("blocking", False)
+    payload.setdefault("limitations", ["Diagnostics do not prove visual success."])
+    payload.setdefault("warnings", [])
+    return payload
+
+
+def _merge_success_warnings(warnings: list[str] | tuple[str, ...], visual_quality: dict[str, Any] | None) -> list[str]:
+    merged = list(warnings)
+    if isinstance(visual_quality, dict):
+        status = visual_quality.get("status")
+        visual_warnings = [str(warning) for warning in visual_quality.get("warnings", []) if isinstance(warning, str)]
+        if status in {"warning", "not_evaluated"} or visual_warnings:
+            merged.append("visual_quality_warning")
+        merged.extend(visual_warnings)
+    return list(dict.fromkeys(merged))
 
 
 def _humanoid_contract_metadata(rig: Any) -> dict[str, Any] | None:
