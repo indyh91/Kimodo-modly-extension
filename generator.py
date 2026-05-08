@@ -18,6 +18,7 @@ from typing import Any
 from host_compat import EXPERIMENTAL, UNSUPPORTED, resolve_host_compatibility
 from glb_animation_exporter import GlbAnimationExporter
 from glb_world_space import extract_world_foot_samples
+from foot_stabilization import foot_stabilization_metadata, result_from_metadata, stabilize_feet, update_stabilization_residuals
 from kimodo_bvh import locate_bvh, parse_bvh
 from retarget_errors import RetargetError
 from retarget_metadata import _humanoid_contract_metadata, retarget_failure_metadata, retarget_success_metadata
@@ -603,6 +604,8 @@ def retarget_motion_bundle(
         if motion_context_path is not None:
             diagnostics["motion_context_npz"] = str(motion_context_path)
         clip = build_retarget_clip(motion, rig, motion_context=motion_context)
+        clip, stabilization_result = stabilize_feet(clip, rig, motion_context, motion_class=_motion_class_for_request(request))
+        diagnostics["foot_stabilization"] = foot_stabilization_metadata(stabilization_result)
         diagnostics["mapping_confidence"] = clip.mapping.confidence
         animated_path = GlbAnimationExporter().write_animation(rig, clip, output_path)
         clip = _enrich_visual_quality_after_export(animated_path, rig, clip, motion_context, diagnostics)
@@ -643,10 +646,28 @@ def _enrich_visual_quality_after_export(animated_path: Path, rig: Any, clip: Any
             world_foot_samples=samples,
             world_foot_sample_details=details,
         )
+        existing_stabilization = getattr(clip, "visual_quality", {}) or {}
+        stabilization = existing_stabilization.get("foot_stabilization") if isinstance(existing_stabilization, dict) else None
+        if isinstance(stabilization, dict):
+            result = result_from_metadata(stabilization)
+            foot_contact = visual_quality.get("checks", {}).get("foot_contact") if isinstance(visual_quality.get("checks"), dict) else None
+            post_max_slide = foot_contact.get("max_slide") if isinstance(foot_contact, dict) and foot_contact.get("confidence") == "measured" else None
+            visual_quality["foot_stabilization"] = foot_stabilization_metadata(update_stabilization_residuals(result, post_max_slide=post_max_slide))
         return replace(clip, visual_quality=visual_quality)
     except Exception as exc:  # noqa: BLE001 - post-export diagnostics must never block success
         diagnostics["world_space_foot_samples"] = {"status": "not_evaluated", "reason": "metrics_exception", "details": {"error": f"{type(exc).__name__}: {exc}"}}
         return clip
+
+
+def _motion_class_for_request(request: dict[str, Any]) -> str:
+    prompt = str(request.get("prompt") or "").lower()
+    if any(token in prompt for token in ("dance", "dancing", "spin", "jump")):
+        return "dynamic"
+    if any(token in prompt for token in ("walk", "walking", "run", "running", "locomotion")):
+        return "walking"
+    if any(token in prompt for token in ("gesture", "wave", "idle", "stand", "static")):
+        return "gesture"
+    return "unknown"
 
 
 def update_bundle_metadata(metadata_path: Path, updates: dict[str, Any], *, bundle_dir: Path | None = None) -> None:
