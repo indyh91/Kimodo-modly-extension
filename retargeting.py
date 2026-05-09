@@ -340,6 +340,9 @@ def build_joint_mapping(source: BvhMotion, target: RigInspection) -> JointMappin
     contract_mapping = _build_humanoid_contract_mapping(source_lookup, target)
     if contract_mapping is not None:
         return contract_mapping
+    semantic_candidate_mapping = _build_semantic_candidate_mapping(source, source_lookup, target)
+    if semantic_candidate_mapping is not None:
+        return semantic_candidate_mapping
     target_lookup = {_normalize(name): name for name in target.joint_names}
     pairs: dict[str, str] = {}
     missing: list[str] = []
@@ -360,6 +363,97 @@ def build_joint_mapping(source: BvhMotion, target: RigInspection) -> JointMappin
     confidence = "compatible" if len(pairs) >= 5 else "best_effort"
     warnings = tuple(f"missing_{semantic}_mapping" for semantic in missing)
     return JointMapping(pairs=pairs, confidence=confidence, warnings=warnings)
+
+
+def _build_semantic_candidate_mapping(source: BvhMotion, source_lookup: dict[str, str], target: RigInspection) -> JointMapping | None:
+    bindings = tuple(getattr(target, "semantic_candidate_bindings", ()) or ())
+    if not bindings:
+        return None
+    candidates = {binding.role: binding for binding in bindings}
+    required_core = ("hips", "spine", "head")
+    if any(role not in candidates for role in required_core):
+        return None
+
+    pairs: dict[str, str] = {}
+    warnings: list[str] = ["semantic_candidate_mapping"]
+    mapped_roles: list[str] = []
+    missing_source_roles: list[str] = []
+    source_role_pairs: list[tuple[str, str]] = []
+    for role, binding in candidates.items():
+        source_joint, source_warnings = _source_joint_for_role(source, source_lookup, role)
+        warnings.extend(source_warnings)
+        if source_joint is None:
+            missing_source_roles.append(role)
+            continue
+        pairs[source_joint] = binding.node_name
+        mapped_roles.append(role)
+        source_role_pairs.append((role, source_joint))
+
+    missing_core_source = sorted(role for role in required_core if role not in mapped_roles)
+    if missing_core_source:
+        raise RetargetError(MAPPING_INCOMPATIBLE, f"Required semantic candidate source joints could not be mapped: {missing_core_source}")
+
+    limb_group_roles = ("left_upper_arm", "right_upper_arm", "left_upper_leg", "right_upper_leg")
+    covered_limb_groups = sum(1 for role in limb_group_roles if role in mapped_roles)
+    for role in limb_group_roles:
+        if role not in candidates:
+            warnings.append(f"semantic_candidate_missing_limb_role:{role}")
+        elif role in missing_source_roles:
+            warnings.append(f"semantic_candidate_missing_limb_source:{role}")
+
+    if missing_source_roles:
+        warnings.extend(f"semantic_candidate_missing_source_role:{role}" for role in sorted(missing_source_roles))
+
+    confidences = [float(binding.confidence) for binding in candidates.values()]
+    coverage = {
+        "semantic_candidate_core": f"{sum(1 for role in required_core if role in mapped_roles)}/3",
+        "semantic_candidate_limb_groups": f"{covered_limb_groups}/4",
+    }
+    if confidences:
+        coverage["semantic_candidate_min_confidence"] = f"{min(confidences):.2f}"
+
+    chains = _semantic_candidate_chain_mappings(target, source_role_pairs, pairs)
+    sidecar_path = getattr(target, "semantic_candidate_path", None)
+    sidecar_provenance = {
+        "schema": str(getattr(target, "semantic_candidate_schema", "") or ""),
+        "path": str(sidecar_path) if sidecar_path is not None else "",
+        "trust": "untrusted",
+    }
+    return JointMapping(
+        pairs=pairs,
+        confidence="semantic_candidate",
+        warnings=_unique_tuple(tuple(warnings)),
+        chains=chains,
+        sidecar_provenance=sidecar_provenance,
+        coverage=coverage,
+    )
+
+
+def _semantic_candidate_chain_mappings(
+    target: RigInspection,
+    source_role_pairs: list[tuple[str, str]],
+    pairs: dict[str, str],
+) -> tuple[ChainMapping, ...]:
+    source_by_role = {role: source_joint for role, source_joint in source_role_pairs}
+    candidate_chains = tuple(getattr(target, "semantic_candidate_chains", ()) or ())
+    mappings: list[ChainMapping] = []
+    for chain in candidate_chains:
+        roles = tuple(getattr(chain, "roles", ()) or ())
+        if not roles:
+            continue
+        source_joints = tuple(source_by_role[role] for role in roles if role in source_by_role)
+        target_joints = tuple(pairs[source_joint] for source_joint in source_joints if source_joint in pairs)
+        mappings.append(
+            ChainMapping(
+                chain_name=str(getattr(chain, "name", "semantic_candidate")),
+                source_joints=source_joints,
+                target_joints=target_joints,
+                required=False,
+                coverage=f"{len(source_joints)}/{len(roles)}",
+                roles=roles,
+            )
+        )
+    return tuple(mappings)
 
 
 def _build_humanoid_contract_mapping(source_lookup: dict[str, str], target: RigInspection) -> JointMapping | None:

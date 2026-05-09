@@ -14,6 +14,7 @@ def retarget_failure_metadata(error: RetargetError, *, diagnostics: dict[str, An
     merged_diagnostics.update(getattr(error, "diagnostics", {}) or {})
     payload = {
         "retarget_status": "failed",
+        "animation_mapping_status": "failed",
         "retarget_error_code": error.code,
         "retarget_error_aliases": list(legacy_error_aliases(error.code)),
         "retarget_error_message": error.message,
@@ -39,8 +40,9 @@ def retarget_success_metadata(
     merged_diagnostics = dict(diagnostics or {})
     if humanoid_contract:
         merged_diagnostics["humanoid_contract"] = humanoid_contract
+    animation_mapping_status = _animation_mapping_status(rig, mapping)
     calibration = getattr(clip, "calibration", {}) or {}
-    if calibration:
+    if calibration and animation_mapping_status != "semantic_candidate":
         merged_diagnostics["retarget_calibration"] = calibration
     visual_quality = _visual_quality_metadata(clip)
     if visual_quality is not None:
@@ -53,6 +55,7 @@ def retarget_success_metadata(
     return {
         "runtime_status": "success",
         "contract_status": getattr(rig, "contract_status", "contract_missing_or_untrusted"),
+        "animation_mapping_status": animation_mapping_status,
         "stabilization_status": stabilization_status or "not_evaluated",
         "retarget_status": "success",
         "retarget_error_code": None,
@@ -70,6 +73,18 @@ def retarget_success_metadata(
         "humanoid_contract": humanoid_contract,
         "retarget_calibration": top_level_calibration,
     }
+
+
+def _animation_mapping_status(rig: Any, mapping: Any) -> str:
+    confidence = getattr(mapping, "confidence", None)
+    warnings = tuple(getattr(mapping, "warnings", ()) or ())
+    if confidence == "calibrated" or "humanoid_contract_sidecar_mapping" in warnings:
+        return "trusted_contract"
+    if confidence == "semantic_candidate" or "semantic_candidate_mapping" in warnings:
+        return "semantic_candidate"
+    if getattr(rig, "contract_status", "contract_missing_or_untrusted") == "trusted":
+        return "trusted_contract"
+    return "best_effort"
 
 
 def _visual_quality_metadata(clip: Any) -> dict[str, Any] | None:

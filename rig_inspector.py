@@ -13,6 +13,9 @@ from retarget_errors import MAPPING_INCOMPATIBLE
 
 
 HUMANOID_CONTRACT_SCHEMA = "modly.humanoid.v1"
+SEMANTIC_CANDIDATES_SCHEMA = "unirig.semantic_candidates.v1"
+SEMANTIC_CANDIDATE_CONFIDENCE_THRESHOLD = 0.60
+REQUIRED_SEMANTIC_CANDIDATE_CORE_ROLES = {"hips", "spine", "head"}
 REQUIRED_HUMANOID_ROLES = {
     "hips",
     "spine",
@@ -55,6 +58,23 @@ class HumanoidChain:
 
 
 @dataclass(frozen=True)
+class SemanticCandidateBinding:
+    role: str
+    node_id: str
+    node_index: int
+    node_name: str
+    confidence: float
+    reasons: tuple[str, ...] = field(default_factory=tuple)
+    source: str | None = None
+
+
+@dataclass(frozen=True)
+class SemanticCandidateChain:
+    name: str
+    roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RigInspection:
     path: Path
     source_kind: str
@@ -73,6 +93,11 @@ class RigInspection:
     humanoid_basis_hints: dict[str, Any] = field(default_factory=dict)
     humanoid_diagnostics: tuple[str, ...] = field(default_factory=tuple)
     contract_status: str = "contract_missing_or_untrusted"
+    semantic_candidate_path: Path | None = None
+    semantic_candidate_schema: str | None = None
+    semantic_candidate_bindings: tuple[SemanticCandidateBinding, ...] = field(default_factory=tuple)
+    semantic_candidate_chains: tuple[SemanticCandidateChain, ...] = field(default_factory=tuple)
+    semantic_candidate_diagnostics: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def compatible(self) -> bool:
@@ -123,6 +148,11 @@ def inspect_rig(path: Path, *, source_kind: str = "unknown_mesh_source") -> RigI
         humanoid_basis_hints=contract["basis_hints"],
         humanoid_diagnostics=contract["diagnostics"],
         contract_status=contract["status"],
+        semantic_candidate_path=contract["semantic_candidate_path"],
+        semantic_candidate_schema=contract["semantic_candidate_schema"],
+        semantic_candidate_bindings=contract["semantic_candidate_bindings"],
+        semantic_candidate_chains=contract["semantic_candidate_chains"],
+        semantic_candidate_diagnostics=contract["semantic_candidate_diagnostics"],
     )
 
 
@@ -139,6 +169,11 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
         "diagnostics": (),
         "warnings": [],
         "status": "contract_missing_or_untrusted",
+        "semantic_candidate_path": None,
+        "semantic_candidate_schema": None,
+        "semantic_candidate_bindings": (),
+        "semantic_candidate_chains": (),
+        "semantic_candidate_diagnostics": (),
     }
     if not sidecar_path.is_file():
         return empty
@@ -151,19 +186,20 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
     if not isinstance(payload, dict):
         diagnostics.append("humanoid_contract_invalid_shape:root")
         return _untrusted_contract(sidecar_path, diagnostics)
+    semantic = _inspect_semantic_candidates(sidecar_path, payload, nodes, skin_joint_indices)
     if "humanoid_contract" not in payload:
         diagnostics.extend(_missing_humanoid_contract_diagnostics(payload))
         if diagnostics:
-            return _untrusted_contract(sidecar_path, diagnostics)
-        return empty
+            return _with_semantic_candidates(_untrusted_contract(sidecar_path, diagnostics), semantic)
+        return _with_semantic_candidates(empty, semantic)
     contract = payload.get("humanoid_contract")
     if not isinstance(contract, dict):
         diagnostics.append("humanoid_contract_invalid_shape:humanoid_contract")
-        return _untrusted_contract(sidecar_path, diagnostics)
+        return _with_semantic_candidates(_untrusted_contract(sidecar_path, diagnostics), semantic)
     schema = contract.get("schema")
     if schema != HUMANOID_CONTRACT_SCHEMA:
         diagnostics.append(f"humanoid_contract_schema_unsupported:{schema}")
-        return _untrusted_contract(sidecar_path, diagnostics)
+        return _with_semantic_candidates(_untrusted_contract(sidecar_path, diagnostics), semantic)
 
     contract_nodes = contract.get("nodes")
     role_source = contract.get("roles") if "roles" in contract else _merged_canonical_role_source(contract, diagnostics)
@@ -172,7 +208,7 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
     chains = _parse_humanoid_chains(contract.get("chains"), roles, diagnostics, contract_nodes=contract_nodes)
     _validate_required_humanoid_contract(roles, chains, diagnostics)
     if diagnostics:
-        return _untrusted_contract(sidecar_path, diagnostics, schema=schema)
+        return _with_semantic_candidates(_untrusted_contract(sidecar_path, diagnostics, schema=schema), semantic)
 
     rest = contract.get("rest") or contract.get("rest_pose") or contract.get("bind_data") or {}
     if not isinstance(rest, dict) or not rest:
@@ -180,7 +216,7 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
     basis_hints = contract.get("basis_hints") or contract.get("basis") or {}
     warnings = []
     quality = contract.get("quality") or contract.get("warnings") or ()
-    return {
+    return _with_semantic_candidates({
         "path": sidecar_path.resolve(),
         "schema": schema,
         "roles": tuple(roles[role] for role in sorted(roles)),
@@ -191,7 +227,7 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
         "diagnostics": ("humanoid_contract_validated",),
         "warnings": sorted(set(warnings)),
         "status": "trusted",
-    }
+    }, semantic)
 
 
 def _untrusted_contract(sidecar_path: Path, diagnostics: list[str], *, schema: str | None = None) -> dict[str, Any]:
@@ -207,7 +243,199 @@ def _untrusted_contract(sidecar_path: Path, diagnostics: list[str], *, schema: s
         "diagnostics": unique,
         "warnings": ["humanoid_contract_missing_or_untrusted"],
         "status": "contract_missing_or_untrusted",
+        "semantic_candidate_path": None,
+        "semantic_candidate_schema": None,
+        "semantic_candidate_bindings": (),
+        "semantic_candidate_chains": (),
+        "semantic_candidate_diagnostics": (),
     }
+
+
+def _with_semantic_candidates(contract: dict[str, Any], semantic: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(contract)
+    merged["semantic_candidate_path"] = semantic["path"]
+    merged["semantic_candidate_schema"] = semantic["schema"]
+    merged["semantic_candidate_bindings"] = semantic["bindings"]
+    merged["semantic_candidate_chains"] = semantic["chains"]
+    merged["semantic_candidate_diagnostics"] = semantic["diagnostics"]
+    return merged
+
+
+def _empty_semantic_candidates() -> dict[str, Any]:
+    return {
+        "path": None,
+        "schema": None,
+        "bindings": (),
+        "chains": (),
+        "diagnostics": (),
+    }
+
+
+def _inspect_semantic_candidates(
+    sidecar_path: Path,
+    payload: dict[str, Any],
+    nodes: list[Any],
+    skin_joint_indices: set[int],
+) -> dict[str, Any]:
+    raw = payload.get("semantic_candidates")
+    if raw is None:
+        return _empty_semantic_candidates()
+    diagnostics: list[str] = []
+    if not isinstance(raw, dict):
+        return _semantic_candidate_result(sidecar_path, None, (), (), ["semantic_candidates_invalid_shape:semantic_candidates"])
+
+    schema = raw.get("schema")
+    if schema != SEMANTIC_CANDIDATES_SCHEMA:
+        diagnostics.append(f"semantic_candidates_schema_unsupported:{schema}")
+        return _semantic_candidate_result(sidecar_path, schema if isinstance(schema, str) else None, (), (), diagnostics)
+
+    diagnostics.extend(_string_tuple(raw.get("diagnostics")))
+    trust = raw.get("trust")
+    if isinstance(trust, dict):
+        if trust.get("trusted") is not False:
+            diagnostics.append("semantic_candidates_trust_not_false")
+        if trust.get("stabilization_eligible") is not False:
+            diagnostics.append("semantic_candidates_stabilization_not_false")
+    else:
+        diagnostics.append("semantic_candidates_invalid_shape:trust")
+
+    raw_roles = raw.get("roles")
+    if not isinstance(raw_roles, dict):
+        diagnostics.append("semantic_candidates_invalid_shape:roles")
+        return _semantic_candidate_result(sidecar_path, schema, (), (), diagnostics)
+
+    bindings: dict[str, SemanticCandidateBinding] = {}
+    node_to_role: dict[int, str] = {}
+    for raw_role, candidate in raw_roles.items():
+        role = _canonical_role(str(raw_role))
+        binding = _parse_semantic_candidate_binding(role, candidate, nodes, skin_joint_indices, diagnostics)
+        if binding is None:
+            continue
+        if role in bindings:
+            diagnostics.append(f"semantic_candidate_duplicate_role:{role}")
+            continue
+        if binding.node_index in node_to_role:
+            diagnostics.append(f"semantic_candidate_duplicate_node_binding:{role}:{node_to_role[binding.node_index]}:{binding.node_index}")
+            continue
+        bindings[role] = binding
+        node_to_role[binding.node_index] = role
+
+    missing_core = sorted(REQUIRED_SEMANTIC_CANDIDATE_CORE_ROLES - set(bindings))
+    if missing_core:
+        diagnostics.append("semantic_candidates_core_incomplete")
+        diagnostics.extend(f"semantic_candidate_missing_core:{role}" for role in missing_core)
+        return _semantic_candidate_result(sidecar_path, schema, (), (), diagnostics)
+
+    chains = _parse_semantic_candidate_chains(raw.get("chains"), set(bindings), diagnostics)
+    diagnostics.append("semantic_candidates_validated")
+    ordered_bindings = tuple(bindings[role] for role in sorted(bindings))
+    return _semantic_candidate_result(sidecar_path, schema, ordered_bindings, tuple(chains), diagnostics)
+
+
+def _semantic_candidate_result(
+    sidecar_path: Path,
+    schema: str | None,
+    bindings: tuple[SemanticCandidateBinding, ...],
+    chains: tuple[SemanticCandidateChain, ...],
+    diagnostics: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "path": sidecar_path.resolve(),
+        "schema": schema,
+        "bindings": bindings,
+        "chains": chains,
+        "diagnostics": tuple(dict.fromkeys(str(item) for item in diagnostics)),
+    }
+
+
+def _parse_semantic_candidate_binding(
+    role: str,
+    candidate: Any,
+    nodes: list[Any],
+    skin_joint_indices: set[int],
+    diagnostics: list[str],
+) -> SemanticCandidateBinding | None:
+    if role not in REQUIRED_HUMANOID_ROLES and role not in {"left_shoulder", "right_shoulder"}:
+        diagnostics.append(f"semantic_candidate_unknown_role:{role}")
+        return None
+    if not isinstance(candidate, dict):
+        diagnostics.append(f"semantic_candidate_invalid_shape:{role}")
+        return None
+    raw_candidate_role = candidate.get("role")
+    if isinstance(raw_candidate_role, str) and _canonical_role(raw_candidate_role) != role:
+        diagnostics.append(f"semantic_candidate_role_mismatch:{role}:{raw_candidate_role}")
+        return None
+    if candidate.get("rejected") is True:
+        diagnostics.append(f"semantic_candidate_rejected:{role}")
+        return None
+    unsafe_flags = candidate.get("unsafe_flags")
+    if isinstance(unsafe_flags, list) and any(str(flag).strip() for flag in unsafe_flags):
+        if role in REQUIRED_SEMANTIC_CANDIDATE_CORE_ROLES:
+            diagnostics.append(f"semantic_candidate_core_unsafe:{role}")
+        else:
+            diagnostics.append(f"semantic_candidate_unsafe:{role}")
+        return None
+    node_index = candidate.get("node_index", candidate.get("node"))
+    if not isinstance(node_index, int):
+        diagnostics.append(f"semantic_candidate_missing_node_index:{role}")
+        return None
+    if node_index < 0 or node_index >= len(nodes):
+        diagnostics.append(f"semantic_candidate_node_index_out_of_range:{role}:{node_index}")
+        return None
+    if node_index not in skin_joint_indices:
+        diagnostics.append(f"semantic_candidate_not_skin_joint:{role}:{node_index}")
+        return None
+    actual_name = _node_name(nodes, node_index)
+    node_name = candidate.get("node_name", candidate.get("name"))
+    if not isinstance(node_name, str) or not node_name.strip():
+        diagnostics.append(f"semantic_candidate_missing_node_name:{role}")
+        return None
+    if node_name.strip() != actual_name:
+        diagnostics.append(f"semantic_candidate_node_name_mismatch:{role}:{node_name}:{actual_name}")
+        return None
+    node_id = candidate.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        diagnostics.append(f"semantic_candidate_missing_node_id:{role}")
+        return None
+    if node_id.strip() != actual_name:
+        diagnostics.append(f"semantic_candidate_node_id_mismatch:{role}:{node_id}:{actual_name}")
+        return None
+    try:
+        confidence = float(candidate.get("confidence"))
+    except (TypeError, ValueError):
+        diagnostics.append(f"semantic_candidate_missing_confidence:{role}")
+        return None
+    if confidence < SEMANTIC_CANDIDATE_CONFIDENCE_THRESHOLD:
+        diagnostics.append(f"semantic_candidate_low_confidence:{role}")
+        return None
+    source = candidate.get("source")
+    return SemanticCandidateBinding(
+        role=role,
+        node_id=node_id.strip(),
+        node_index=node_index,
+        node_name=actual_name,
+        confidence=confidence,
+        reasons=_string_tuple(candidate.get("reasons")),
+        source=source.strip() if isinstance(source, str) and source.strip() else None,
+    )
+
+
+def _parse_semantic_candidate_chains(raw: Any, roles: set[str], diagnostics: list[str]) -> list[SemanticCandidateChain]:
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        diagnostics.append("semantic_candidates_invalid_shape:chains")
+        return []
+    chains: list[SemanticCandidateChain] = []
+    for raw_name, raw_roles in raw.items():
+        name = _canonical_chain_name(str(raw_name))
+        if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
+            diagnostics.append(f"semantic_candidate_invalid_chain:{raw_name}")
+            continue
+        chain_roles = tuple(_canonical_role(role) for role in raw_roles if _canonical_role(role) in roles)
+        if chain_roles:
+            chains.append(SemanticCandidateChain(name=name, roles=chain_roles))
+    return chains
 
 
 def _missing_humanoid_contract_diagnostics(payload: dict[str, Any]) -> list[str]:
