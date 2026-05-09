@@ -44,6 +44,23 @@ FIVE_MOTION_WORKFLOWS = {
 
 
 class RetargetingFoundationTests(unittest.TestCase):
+    def _assert_untrusted_contract_degradation(
+        self,
+        rig,
+        *,
+        expected_diagnostics: tuple[str, ...] | list[str],
+        expected_schema: str | None = None,
+    ) -> None:
+        self.assertEqual(rig.contract_status, "contract_missing_or_untrusted")
+        self.assertIsNotNone(rig.humanoid_contract_path)
+        self.assertEqual(rig.humanoid_contract_schema, expected_schema)
+        self.assertEqual(rig.humanoid_roles, ())
+        self.assertEqual(rig.humanoid_chains, ())
+        self.assertIn("humanoid_contract_missing_or_untrusted", rig.warnings)
+        for diagnostic in expected_diagnostics:
+            self.assertIn(diagnostic, rig.humanoid_diagnostics)
+        self.assertEqual(len(rig.humanoid_diagnostics), len(dict.fromkeys(rig.humanoid_diagnostics)))
+
     def test_parse_synthetic_bvh(self):
         motion = parse_bvh(FIXTURES / "synthetic_walk.bvh")
 
@@ -1373,7 +1390,9 @@ class RetargetingFoundationTests(unittest.TestCase):
 
         mapping = build_joint_mapping(motion, rig)
 
+        self.assertEqual(rig.contract_status, "contract_missing_or_untrusted")
         self.assertIsNone(rig.humanoid_contract_path)
+        self.assertEqual(rig.humanoid_diagnostics, ())
         self.assertEqual(mapping.pairs["Hips"], "bone_0")
         self.assertIn("anonymous_unirig_topology_mapping", mapping.warnings)
 
@@ -1397,7 +1416,9 @@ class RetargetingFoundationTests(unittest.TestCase):
 
         mapping = build_joint_mapping(motion, rig)
 
-        self.assertIsNone(rig.humanoid_contract_path)
+        self.assertEqual(rig.contract_status, "contract_missing_or_untrusted")
+        self.assertIsNotNone(rig.humanoid_contract_path)
+        self.assertIn("humanoid_contract_missing", rig.humanoid_diagnostics)
         self.assertEqual(mapping.pairs["Hips"], "bone_0")
         self.assertIn("anonymous_unirig_topology_mapping", mapping.warnings)
 
@@ -1434,7 +1455,7 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(chains["left_arm_proximal"], ("left_shoulder", "left_upper_arm", "left_forearm", "left_hand"))
         self.assertEqual(chains["right_arm_proximal"], ("right_shoulder", "right_upper_arm", "right_forearm", "right_hand"))
 
-    def test_humanoid_contract_optional_shoulder_unknown_node_fails_closed(self):
+    def test_humanoid_contract_optional_shoulder_unknown_node_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "canonical_unirig_shoulders.gltf"
             self._write_canonical_unirig_shoulder_contract_rig_and_sidecar(rig_path)
@@ -1442,11 +1463,13 @@ class RetargetingFoundationTests(unittest.TestCase):
             payload["humanoid_contract"]["optional_roles"]["left_shoulder"] = "bone_missing"
             rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        self.assertIn("humanoid_contract_role_unknown_node_id:left_shoulder:bone_missing", ctx.exception.message)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_role_unknown_node_id:left_shoulder:bone_missing",),
+            expected_schema="modly.humanoid.v1",
+        )
 
     def test_calibrated_shoulder_source_maps_to_optional_proximal_target_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1553,7 +1576,7 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertIn("missing_source_role:torso:neck", ctx.exception.message)
         self.assertNotIn("source_neck_role_bridged", ctx.exception.message)
 
-    def test_humanoid_contract_canonical_bad_node_reference_fails_closed(self):
+    def test_humanoid_contract_canonical_bad_node_reference_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "canonical_unirig.gltf"
             self._write_canonical_unirig_contract_rig_and_sidecar(rig_path)
@@ -1561,11 +1584,13 @@ class RetargetingFoundationTests(unittest.TestCase):
             payload["humanoid_contract"]["required_roles"]["head"] = "bone_missing"
             rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        self.assertIn("humanoid_contract_role_unknown_node_id:head:bone_missing", ctx.exception.message)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_role_unknown_node_id:head:bone_missing",),
+            expected_schema="modly.humanoid.v1",
+        )
 
     def test_humanoid_contract_legacy_roles_shape_remains_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1578,7 +1603,7 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(rig.humanoid_contract_schema, "modly.humanoid.v1")
         self.assertEqual({binding.role for binding in rig.humanoid_roles}, set(self._contract_roles()))
 
-    def test_malformed_present_humanoid_contract_still_fails_closed(self):
+    def test_malformed_present_humanoid_contract_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
@@ -1587,85 +1612,91 @@ class RetargetingFoundationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        self.assertIn("humanoid_contract_invalid_shape:humanoid_contract", ctx.exception.message)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_invalid_shape:humanoid_contract",),
+        )
 
-    def test_humanoid_contract_wrong_schema_fails_closed(self):
+    def test_humanoid_contract_wrong_schema_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
             self._write_contract_sidecar(rig_path, schema="wrong.schema")
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        self.assertIn("humanoid_contract_schema_unsupported:wrong.schema", ctx.exception.message)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_schema_unsupported:wrong.schema",),
+        )
 
-    def test_humanoid_contract_invalid_json_fails_closed_with_stable_diagnostics(self):
+    def test_humanoid_contract_invalid_json_degrades_with_stable_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
             rig_path.with_suffix(".rigmeta.json").write_text("{not json", encoding="utf-8")
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        diagnostics = ctx.exception.diagnostics["humanoid_contract"]["diagnostics"]
-        self.assertEqual(diagnostics, ["humanoid_contract_invalid_json"])
-        self.assertIn("humanoid_contract_invalid_json", ctx.exception.message)
-
-    def test_humanoid_contract_invalid_root_roles_and_chains_shapes_fail_closed(self):
-        cases = (
-            ([], "humanoid_contract_invalid_shape:root"),
-            ({"humanoid_contract": {"schema": "modly.humanoid.v1", "roles": "bad", "chains": {}}}, "humanoid_contract_invalid_shape:roles"),
-            ({"humanoid_contract": {"schema": "modly.humanoid.v1", "roles": {}, "chains": "bad"}}, "humanoid_contract_invalid_shape:chains"),
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_invalid_json",),
         )
-        for payload, expected in cases:
+        self.assertEqual(rig.humanoid_diagnostics, ("humanoid_contract_invalid_json",))
+
+    def test_humanoid_contract_invalid_root_roles_and_chains_shapes_degrade_without_blocking_inspection(self):
+        cases = (
+            ([], "humanoid_contract_invalid_shape:root", None),
+            ({"humanoid_contract": {"schema": "modly.humanoid.v1", "roles": "bad", "chains": {}}}, "humanoid_contract_invalid_shape:roles", "modly.humanoid.v1"),
+            ({"humanoid_contract": {"schema": "modly.humanoid.v1", "roles": {}, "chains": "bad"}}, "humanoid_contract_invalid_shape:chains", "modly.humanoid.v1"),
+        )
+        for payload, expected, expected_schema in cases:
             with self.subTest(expected=expected):
                 with tempfile.TemporaryDirectory() as tmp:
                     rig_path = Path(tmp) / "contract_avatar.gltf"
                     self._write_contract_rig(rig_path)
                     rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
 
-                    with self.assertRaises(RetargetError) as ctx:
-                        inspect_rig(rig_path)
+                    rig = inspect_rig(rig_path)
 
-                self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-                diagnostics = ctx.exception.diagnostics["humanoid_contract"]["diagnostics"]
-                self.assertEqual(diagnostics[0], expected)
-                self.assertEqual(len(diagnostics), len(dict.fromkeys(diagnostics)))
+                self._assert_untrusted_contract_degradation(
+                    rig,
+                    expected_diagnostics=(expected,),
+                    expected_schema=expected_schema,
+                )
+                self.assertEqual(rig.humanoid_diagnostics[0], expected)
 
-    def test_humanoid_contract_bad_role_reference_fails_closed(self):
+    def test_humanoid_contract_bad_role_reference_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
             self._write_contract_sidecar(rig_path, overrides={"head": {"node_index": 4, "node_name": "not_head"}})
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        self.assertIn("humanoid_contract_role_node_name_mismatch:head", ctx.exception.message)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_role_node_name_mismatch:head:not_head:contract_head",),
+            expected_schema="modly.humanoid.v1",
+        )
 
-    def test_humanoid_contract_out_of_range_node_reference_fails_closed(self):
+    def test_humanoid_contract_out_of_range_node_reference_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
             self._write_contract_sidecar(rig_path, overrides={"head": {"node_index": 999, "node_name": "missing"}})
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        diagnostics = ctx.exception.diagnostics["humanoid_contract"]["diagnostics"]
-        self.assertIn("humanoid_contract_role_node_index_out_of_range:head:999", diagnostics)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_role_node_index_out_of_range:head:999",),
+            expected_schema="modly.humanoid.v1",
+        )
 
-    def test_humanoid_contract_non_skin_joint_reference_fails_closed(self):
+    def test_humanoid_contract_non_skin_joint_reference_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
@@ -1674,14 +1705,15 @@ class RetargetingFoundationTests(unittest.TestCase):
             rig_path.write_text(json.dumps(document), encoding="utf-8")
             self._write_contract_sidecar(rig_path, overrides={"head": {"node_index": len(document["nodes"]) - 1, "node_name": "contract_extra"}})
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
 
-        self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        diagnostics = ctx.exception.diagnostics["humanoid_contract"]["diagnostics"]
-        self.assertIn("humanoid_contract_role_not_skin_joint:head:17", diagnostics)
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_role_not_skin_joint:head:17",),
+            expected_schema="modly.humanoid.v1",
+        )
 
-    def test_humanoid_contract_duplicate_roles_and_node_bindings_fail_closed(self):
+    def test_humanoid_contract_duplicate_roles_and_node_bindings_degrade_without_blocking_inspection(self):
         roles = self._contract_roles()
         valid_bindings = [
             {"role": role, "node_index": index, "node_name": f"contract_{role}"}
@@ -1703,13 +1735,13 @@ class RetargetingFoundationTests(unittest.TestCase):
                     self._write_contract_rig(rig_path)
                     self._write_contract_sidecar_payload(rig_path, roles=bindings)
 
-                    with self.assertRaises(RetargetError) as ctx:
-                        inspect_rig(rig_path)
+                    rig = inspect_rig(rig_path)
 
-                self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-                diagnostics = ctx.exception.diagnostics["humanoid_contract"]["diagnostics"]
-                self.assertIn(expected, diagnostics)
-                self.assertEqual(len(diagnostics), len(dict.fromkeys(diagnostics)))
+                self._assert_untrusted_contract_degradation(
+                    rig,
+                    expected_diagnostics=(expected,),
+                    expected_schema="modly.humanoid.v1",
+                )
 
     def test_humanoid_contract_required_source_gaps_fail_closed_for_calibration(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1744,18 +1776,38 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, CALIBRATION_UNAVAILABLE)
         self.assertIn("requires target rest transforms or basis hints", ctx.exception.message)
 
-    def test_humanoid_contract_missing_required_role_and_chain_fail(self):
+    def test_humanoid_contract_missing_required_role_and_chain_degrades_without_blocking_inspection(self):
         with tempfile.TemporaryDirectory() as tmp:
             rig_path = Path(tmp) / "contract_avatar.gltf"
             self._write_contract_rig(rig_path)
             self._write_contract_sidecar(rig_path, omit_roles={"neck"}, omit_chains={"torso"})
 
-            with self.assertRaises(RetargetError) as ctx:
-                inspect_rig(rig_path)
+            rig = inspect_rig(rig_path)
+
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_missing_role:neck", "humanoid_contract_missing_chain:torso"),
+            expected_schema="modly.humanoid.v1",
+        )
+
+    def test_untrusted_contract_on_unmappable_rig_still_fails_as_mapping_error_not_contract_error(self):
+        motion = parse_bvh(FIXTURES / "synthetic_walk.bvh")
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, schema="wrong.schema")
+            rig = inspect_rig(rig_path)
+
+        self._assert_untrusted_contract_degradation(
+            rig,
+            expected_diagnostics=("humanoid_contract_schema_unsupported:wrong.schema",),
+        )
+        with self.assertRaises(RetargetError) as ctx:
+            build_joint_mapping(motion, rig)
 
         self.assertEqual(ctx.exception.code, MAPPING_INCOMPATIBLE)
-        self.assertIn("humanoid_contract_missing_role:neck", ctx.exception.message)
-        self.assertIn("humanoid_contract_missing_chain:torso", ctx.exception.message)
+        self.assertIn("Required humanoid joints could not be mapped", ctx.exception.message)
+        self.assertNotIn("humanoid_contract_schema_unsupported", ctx.exception.message)
 
     def test_exporter_writes_animation_clip_to_gltf(self):
         exporter = GlbAnimationExporter()

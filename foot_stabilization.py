@@ -153,6 +153,10 @@ def evaluate_stabilization_gates(
 def stabilize_feet(clip: Any, rig: Any, motion_context: Any, *, motion_class: str | None = None, config: FootStabilizationConfig | None = None) -> tuple[Any, FootStabilizationResult]:
     config = config or FootStabilizationConfig()
     normalized = _normalize_motion_class(motion_class or _infer_motion_class(clip))
+    if getattr(rig, "contract_status", "trusted" if _has_trusted_foot_roles(rig) else "contract_missing_or_untrusted") != "trusted":
+        result = _result_from_skip(normalized, "contract_missing_or_untrusted", config, mode="none")
+        result = replace(result, status="not_evaluated")
+        return _with_stabilization_metadata(clip, result), result
     if normalized in {"walking", "locomotion"} and not _has_valid_leg_chains(rig):
         result = _result_from_skip(normalized, "missing_valid_leg_chains", config, mode="none")
         return _with_stabilization_metadata(clip, result), result
@@ -162,7 +166,11 @@ def stabilize_feet(clip: Any, rig: Any, motion_context: Any, *, motion_class: st
     if root_channel is None:
         result = _result_from_skip(normalized, "missing_root_translation_channel", config, mode="none")
         return _with_stabilization_metadata(clip, result), result
-    samples = {"left": tuple(root_channel.values), "right": tuple(root_channel.values)}
+    samples = _trusted_pre_export_foot_samples(clip)
+    if samples is None:
+        result = _result_from_skip(normalized, "missing_pre_export_foot_samples", config, mode="none")
+        result = replace(result, status="not_evaluated", warnings=("foot_stabilization/root_proxy_samples_not_trusted",))
+        return _with_stabilization_metadata(clip, result), result
     gates = evaluate_stabilization_gates(
         foot_samples=samples,
         foot_contacts=contacts,
@@ -517,6 +525,38 @@ def _samples_have_both_feet(foot_samples: dict[str, tuple[tuple[float, float, fl
 
 def _finite_samples(foot_samples: dict[str, tuple[tuple[float, float, float], ...]]) -> bool:
     return all(len(sample) >= 3 and all(math.isfinite(float(component)) for component in sample[:3]) for samples in foot_samples.values() for sample in samples)
+
+
+def _trusted_pre_export_foot_samples(clip: Any) -> dict[str, tuple[tuple[float, float, float], ...]] | None:
+    calibration = getattr(clip, "calibration", {}) or {}
+    if not isinstance(calibration, dict):
+        return None
+    payload = calibration.get("pre_export_foot_samples")
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return None
+    raw_samples = payload.get("samples")
+    if not isinstance(raw_samples, dict):
+        return None
+    samples: dict[str, tuple[tuple[float, float, float], ...]] = {}
+    for side in ("left", "right"):
+        raw_side = raw_samples.get(side)
+        if not isinstance(raw_side, (list, tuple)) or not raw_side:
+            return None
+        parsed_side: list[tuple[float, float, float]] = []
+        for sample in raw_side:
+            if not isinstance(sample, (list, tuple)) or len(sample) < 3:
+                return None
+            try:
+                parsed = (float(sample[0]), float(sample[1]), float(sample[2]))
+            except (TypeError, ValueError):
+                return None
+            parsed_side.append(tuple(_clean_float(value) for value in parsed))
+        samples[side] = tuple(parsed_side)
+    root_channel = _root_translation_channel(clip)
+    root_values = tuple(root_channel.values) if root_channel is not None else ()
+    if samples.get("left") == root_values and samples.get("right") == root_values:
+        return None
+    return samples
 
 
 def _contact_windows(foot_contacts: tuple[tuple[float, ...], ...], *, side: str, threshold: float) -> list[tuple[int, int]]:

@@ -48,7 +48,12 @@ def retarget_success_metadata(
     top_level_calibration = calibration if calibration.get("version") else None
     merged_warnings = _merge_success_warnings(warnings, visual_quality)
     visual_quality_status = visual_quality.get("status") if isinstance(visual_quality, dict) else None
+    foot_stabilization = visual_quality.get("foot_stabilization") if isinstance(visual_quality, dict) else None
+    stabilization_status = foot_stabilization.get("status") if isinstance(foot_stabilization, dict) else "not_evaluated"
     return {
+        "runtime_status": "success",
+        "contract_status": getattr(rig, "contract_status", "contract_missing_or_untrusted"),
+        "stabilization_status": stabilization_status or "not_evaluated",
         "retarget_status": "success",
         "retarget_error_code": None,
         "retarget_error_aliases": [],
@@ -100,6 +105,8 @@ def _humanoid_contract_metadata(rig: Any) -> dict[str, Any] | None:
     return {
         "path": str(path),
         "schema": getattr(rig, "humanoid_contract_schema", None),
+        "status": getattr(rig, "contract_status", "contract_missing_or_untrusted"),
+        "trusted": getattr(rig, "contract_status", "contract_missing_or_untrusted") == "trusted",
         "roles": [serializable(role) for role in getattr(rig, "humanoid_roles", ())],
         "chains": [serializable(chain) for chain in getattr(rig, "humanoid_chains", ())],
         "quality": list(getattr(rig, "humanoid_quality", ())),

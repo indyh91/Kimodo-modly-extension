@@ -72,6 +72,7 @@ class RigInspection:
     humanoid_rest: dict[str, Any] = field(default_factory=dict)
     humanoid_basis_hints: dict[str, Any] = field(default_factory=dict)
     humanoid_diagnostics: tuple[str, ...] = field(default_factory=tuple)
+    contract_status: str = "contract_missing_or_untrusted"
 
     @property
     def compatible(self) -> bool:
@@ -121,6 +122,7 @@ def inspect_rig(path: Path, *, source_kind: str = "unknown_mesh_source") -> RigI
         humanoid_rest=contract["rest"],
         humanoid_basis_hints=contract["basis_hints"],
         humanoid_diagnostics=contract["diagnostics"],
+        contract_status=contract["status"],
     )
 
 
@@ -136,6 +138,7 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
         "basis_hints": {},
         "diagnostics": (),
         "warnings": [],
+        "status": "contract_missing_or_untrusted",
     }
     if not sidecar_path.is_file():
         return empty
@@ -144,20 +147,23 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         diagnostics.append("humanoid_contract_invalid_json")
-        _raise_contract_error(sidecar_path, diagnostics)
+        return _untrusted_contract(sidecar_path, diagnostics)
     if not isinstance(payload, dict):
         diagnostics.append("humanoid_contract_invalid_shape:root")
-        _raise_contract_error(sidecar_path, diagnostics)
+        return _untrusted_contract(sidecar_path, diagnostics)
     if "humanoid_contract" not in payload:
+        diagnostics.extend(_missing_humanoid_contract_diagnostics(payload))
+        if diagnostics:
+            return _untrusted_contract(sidecar_path, diagnostics)
         return empty
     contract = payload.get("humanoid_contract")
     if not isinstance(contract, dict):
         diagnostics.append("humanoid_contract_invalid_shape:humanoid_contract")
-        _raise_contract_error(sidecar_path, diagnostics)
+        return _untrusted_contract(sidecar_path, diagnostics)
     schema = contract.get("schema")
     if schema != HUMANOID_CONTRACT_SCHEMA:
         diagnostics.append(f"humanoid_contract_schema_unsupported:{schema}")
-        _raise_contract_error(sidecar_path, diagnostics)
+        return _untrusted_contract(sidecar_path, diagnostics)
 
     contract_nodes = contract.get("nodes")
     role_source = contract.get("roles") if "roles" in contract else _merged_canonical_role_source(contract, diagnostics)
@@ -166,7 +172,7 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
     chains = _parse_humanoid_chains(contract.get("chains"), roles, diagnostics, contract_nodes=contract_nodes)
     _validate_required_humanoid_contract(roles, chains, diagnostics)
     if diagnostics:
-        _raise_contract_error(sidecar_path, diagnostics)
+        return _untrusted_contract(sidecar_path, diagnostics, schema=schema)
 
     rest = contract.get("rest") or contract.get("rest_pose") or contract.get("bind_data") or {}
     if not isinstance(rest, dict) or not rest:
@@ -184,7 +190,54 @@ def _inspect_humanoid_contract(path: Path, nodes: list[Any], skin_joint_indices:
         "basis_hints": basis_hints if isinstance(basis_hints, dict) else {},
         "diagnostics": ("humanoid_contract_validated",),
         "warnings": sorted(set(warnings)),
+        "status": "trusted",
     }
+
+
+def _untrusted_contract(sidecar_path: Path, diagnostics: list[str], *, schema: str | None = None) -> dict[str, Any]:
+    unique = tuple(dict.fromkeys(diagnostics))
+    return {
+        "path": sidecar_path.resolve(),
+        "schema": schema,
+        "roles": (),
+        "chains": (),
+        "quality": (),
+        "rest": {},
+        "basis_hints": {},
+        "diagnostics": unique,
+        "warnings": ["humanoid_contract_missing_or_untrusted"],
+        "status": "contract_missing_or_untrusted",
+    }
+
+
+def _missing_humanoid_contract_diagnostics(payload: dict[str, Any]) -> list[str]:
+    diagnostics: list[str] = []
+    metadata_mode = str(payload.get("metadata_mode") or "").strip().lower()
+    if metadata_mode == "auto":
+        diagnostics.append("humanoid_contract_missing:metadata_mode_auto")
+    if isinstance(payload.get("humanoid_provenance"), dict):
+        diagnostics.append("humanoid_contract_missing:provenance_only")
+    if isinstance(payload.get("legacy_humanoid_mapping"), dict) or isinstance(payload.get("humanoid_mapping"), dict):
+        diagnostics.append("humanoid_contract_missing:legacy_mapping_only")
+    if _contains_exact_bone_profile_signal(payload):
+        diagnostics.append("humanoid_contract_missing:bone_profile_only")
+    if not diagnostics and payload:
+        diagnostics.append("humanoid_contract_missing")
+    return diagnostics
+
+
+def _contains_exact_bone_profile_signal(value: Any) -> bool:
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if not token.startswith("bone_"):
+            return False
+        suffix = token[5:]
+        return bool(suffix) and suffix.isdigit()
+    if isinstance(value, dict):
+        return any(_contains_exact_bone_profile_signal(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_exact_bone_profile_signal(item) for item in value)
+    return False
 
 
 def _parse_humanoid_roles(

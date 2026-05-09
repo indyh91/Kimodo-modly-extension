@@ -95,3 +95,38 @@ def test_generator_enrichment_preserves_success_metadata_when_stabilization_was_
     assert stabilization["status"] == "skipped"
     assert stabilization["skipped_reason"] == "missing_valid_leg_chains"
     assert stabilization["post_max_slide"] is None
+
+
+def test_generator_motion_classification_uses_evidence_instead_of_prompt_hint():
+    clip = RetargetClip(
+        name="Kimodo Motion",
+        duration=0.1,
+        frame_time=1.0 / 30.0,
+        root_translations=((0.0, 0.0, 0.0), (0.25, 0.0, 0.0), (0.5, 0.0, 0.0), (0.8, 0.0, 0.0)),
+        channels=(),
+        mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+        warnings=(),
+        calibration={
+            "pre_export_foot_samples": {
+                "status": "success",
+                "samples": {
+                    "left": ((-0.2, 0.0, 0.0), (-0.2, 0.0, 0.0), (0.1, 0.0, 0.0), (0.1, 0.0, 0.0)),
+                    "right": ((0.2, 0.0, 0.0), (0.5, 0.0, 0.0), (0.5, 0.0, 0.0), (0.8, 0.0, 0.0)),
+                },
+            }
+        },
+    )
+    motion_context = type("MotionContext", (), {"foot_contacts": ((1.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 1.0))})()
+    rig = type("Rig", (), {"contract_status": "trusted", "humanoid_chains": (type("Chain", (), {"name": "left_leg", "roles": ("left_hip", "left_foot")})(),)})()
+
+    classification = generator._classify_motion_for_stabilization(
+        request={"prompt": "Person raising one arm"},
+        clip=clip,
+        rig=rig,
+        motion_context=motion_context,
+    )
+
+    assert classification["class"] == "walking"
+    assert classification["prompt_hint"] == "Person raising one arm"
+    assert "prompt_conflicts_with_kinematics" in classification["conflicts"]
+    assert classification["evidence"]["trusted_leg_chains"] is True

@@ -20,7 +20,8 @@ from glb_animation_exporter import GlbAnimationExporter
 from glb_world_space import extract_world_foot_samples
 from foot_stabilization import foot_stabilization_metadata, result_from_metadata, stabilize_feet, update_stabilization_residuals
 from kimodo_bvh import locate_bvh, parse_bvh
-from retarget_errors import RetargetError
+from motion_evidence import classify_motion_evidence
+from retarget_errors import MAPPING_INCOMPATIBLE, RetargetError
 from retarget_metadata import _humanoid_contract_metadata, retarget_failure_metadata, retarget_success_metadata
 from retargeting import build_retarget_clip, load_motion_context, visual_quality_diagnostics
 from rig_inspector import inspect_rig
@@ -604,7 +605,9 @@ def retarget_motion_bundle(
         if motion_context_path is not None:
             diagnostics["motion_context_npz"] = str(motion_context_path)
         clip = build_retarget_clip(motion, rig, motion_context=motion_context)
-        clip, stabilization_result = stabilize_feet(clip, rig, motion_context, motion_class=_motion_class_for_request(request))
+        motion_classification = _classify_motion_for_stabilization(request=request, clip=clip, rig=rig, motion_context=motion_context)
+        diagnostics["motion_evidence_classification"] = motion_classification
+        clip, stabilization_result = stabilize_feet(clip, rig, motion_context, motion_class=motion_classification["class"])
         diagnostics["foot_stabilization"] = foot_stabilization_metadata(stabilization_result)
         diagnostics["mapping_confidence"] = clip.mapping.confidence
         animated_path = GlbAnimationExporter().write_animation(rig, clip, output_path)
@@ -616,9 +619,24 @@ def retarget_motion_bundle(
         )
         return animated_path
     except RetargetError as exc:
+        failure_metadata = retarget_failure_metadata(exc, diagnostics=diagnostics)
+        fallback_path = bundle_dir / "preview.glb"
+        if exc.code == MAPPING_INCOMPATIBLE and fallback_path.is_file():
+            update_bundle_metadata(
+                metadata_path,
+                {
+                    **failure_metadata,
+                    "runtime_status": "success_with_fallback",
+                    "stabilization_status": "not_evaluated",
+                    "fallback_output": str(fallback_path.relative_to(bundle_dir)),
+                    "fallback_reason": "retarget_mapping_incompatible",
+                },
+                bundle_dir=bundle_dir,
+            )
+            return fallback_path
         update_bundle_metadata(
             metadata_path,
-            retarget_failure_metadata(exc, diagnostics=diagnostics),
+            failure_metadata,
             bundle_dir=bundle_dir,
         )
         raise KimodoRuntimeError(
@@ -659,15 +677,31 @@ def _enrich_visual_quality_after_export(animated_path: Path, rig: Any, clip: Any
         return clip
 
 
-def _motion_class_for_request(request: dict[str, Any]) -> str:
-    prompt = str(request.get("prompt") or "").lower()
-    if any(token in prompt for token in ("dance", "dancing", "spin", "jump")):
-        return "dynamic"
-    if any(token in prompt for token in ("walk", "walking", "run", "running", "locomotion")):
-        return "walking"
-    if any(token in prompt for token in ("gesture", "wave", "idle", "stand", "static")):
-        return "gesture"
-    return "unknown"
+def _classify_motion_for_stabilization(*, request: dict[str, Any], clip: Any, rig: Any, motion_context: Any) -> dict[str, Any]:
+    samples = None
+    calibration = getattr(clip, "calibration", None)
+    pre_export = calibration.get("pre_export_foot_samples") if isinstance(calibration, dict) else None
+    if isinstance(pre_export, dict) and pre_export.get("status") == "success" and isinstance(pre_export.get("samples"), dict):
+        samples = pre_export.get("samples")
+    root_samples = getattr(motion_context, "root_samples", None) if motion_context is not None else None
+    if root_samples is None:
+        root_samples = getattr(clip, "root_translations", ())
+    contacts = getattr(motion_context, "foot_contacts", None) if motion_context is not None else None
+    return classify_motion_evidence(
+        root_samples=root_samples,
+        foot_samples=samples,
+        foot_contacts=contacts,
+        dynamic_intensity=None,
+        trusted_leg_chains=_has_classifier_leg_chain_evidence(rig),
+        prompt_hint=str(request.get("prompt") or "") or None,
+    )
+
+
+def _has_classifier_leg_chain_evidence(rig: Any) -> bool:
+    if getattr(rig, "contract_status", "contract_missing_or_untrusted") != "trusted":
+        return False
+    chains = getattr(rig, "humanoid_chains", ()) or ()
+    return any("leg" in str(getattr(chain, "name", "")).lower() and tuple(getattr(chain, "roles", ()) or ()) for chain in chains)
 
 
 def update_bundle_metadata(metadata_path: Path, updates: dict[str, Any], *, bundle_dir: Path | None = None) -> None:

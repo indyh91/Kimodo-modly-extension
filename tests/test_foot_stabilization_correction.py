@@ -12,14 +12,23 @@ from rig_inspector import HumanoidChain, HumanoidRoleBinding, RigInspection  # n
 
 
 def _clip_with_channels(*channels):
+    root_values = tuple(channels[0].values) if channels else ()
+    foot_samples = {
+        "status": "success",
+        "samples": {
+            "left": tuple((value[0] - 0.2, value[1], value[2] + 0.3) for value in root_values),
+            "right": tuple((value[0] + 0.2, value[1], value[2] + 0.3) for value in root_values),
+        },
+    }
     return RetargetClip(
         name="Kimodo Motion",
         duration=0.1,
         frame_time=1.0 / 30.0,
-        root_translations=tuple(channels[0].values) if channels else (),
+        root_translations=root_values,
         channels=tuple(channels),
         mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
         warnings=(),
+        calibration={"pre_export_foot_samples": foot_samples},
         visual_quality={"version": "kimodo.visual_quality.v1", "blocking": False, "status": "not_evaluated", "warnings": [], "limitations": [], "checks": {}},
     )
 
@@ -59,6 +68,7 @@ def _rig(*, calibrated=True):
         humanoid_chains=chains if calibrated else (),
         humanoid_rest={"roles": {role.role: {"local_translation": [0.0, -1.0, 0.0]} for role in roles}},
         humanoid_basis_hints={"up_axis": "Y"},
+        contract_status="trusted" if calibrated else "contract_missing_or_untrusted",
     )
 
 
@@ -147,9 +157,9 @@ def test_walking_requires_calibrated_leg_chains_and_fails_closed_without_them():
 
     stabilized, result = stabilize_feet(clip, _rig(calibrated=False), context, motion_class="walking")
 
-    assert result.status == "skipped"
+    assert result.status == "not_evaluated"
     assert result.mode == "none"
-    assert result.skipped_reason == "missing_valid_leg_chains"
+    assert result.skipped_reason == "contract_missing_or_untrusted"
     assert stabilized.channels == clip.channels
 
 

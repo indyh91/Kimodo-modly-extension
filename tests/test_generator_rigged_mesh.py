@@ -1,6 +1,7 @@
 import os
 import contextlib
 import json
+import shutil
 import struct
 import tempfile
 import unittest
@@ -198,25 +199,67 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "animated.glb")
         self.assertEqual(calls[0][2], 2)
 
-    def test_generate_animate_rigged_mesh_reports_humanoid_contract_failure_diagnostics(self):
+    def test_generate_animate_rigged_mesh_reports_untrusted_contract_without_blocking_runtime_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             outputs = Path(tmp) / "outputs"
             rig = Path(tmp) / "contract_avatar.gltf"
-            self._write_contract_rig_and_sidecar(rig, schema="wrong.schema")
+            shutil.copyfile(FIXTURES / "tiny_rigged.gltf", rig)
+            rig.with_suffix(".rigmeta.json").write_text(
+                json.dumps({"humanoid_contract": {"schema": "wrong.schema"}}),
+                encoding="utf-8",
+            )
             instance = KimodoGenerator(Path(tmp) / "model", outputs)
             instance._loaded = True
 
             with self._patched_runtime(run_side_effect=self._write_motion_bundle):
-                with self.assertRaises(KimodoRuntimeError) as ctx:
-                    instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(rig)})
+                animated = instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(rig)})
 
-            bundle = next(outputs.iterdir())
-            metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+            metadata = json.loads((animated.parent / "metadata.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(ctx.exception.code, "MAPPING_INCOMPATIBLE")
-        self.assertEqual(metadata["retarget_status"], "failed")
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["runtime_status"], "success")
+        self.assertEqual(metadata["contract_status"], "contract_missing_or_untrusted")
+        self.assertEqual(metadata["stabilization_status"], "not_evaluated")
         self.assertIn("humanoid_contract", metadata["diagnostics"])
+        self.assertFalse(metadata["diagnostics"]["humanoid_contract"]["trusted"])
         self.assertIn("humanoid_contract_schema_unsupported:wrong.schema", metadata["diagnostics"]["humanoid_contract"]["diagnostics"])
+
+    def test_generate_animate_rigged_mesh_degrades_untrusted_contract_matrix_without_blocking_runtime_success(self):
+        cases = [
+            ("missing_sidecar", None, None),
+            ("malformed_json", "{not json", "humanoid_contract_invalid_json"),
+            ("provenance_only", {"humanoid_provenance": {"source": "legacy-export"}}, "humanoid_contract_missing:provenance_only"),
+            ("auto_metadata", {"metadata_mode": "auto", "humanoid_provenance": {"source": "auto"}}, "humanoid_contract_missing:metadata_mode_auto"),
+            ("legacy_fallback", {"legacy_humanoid_mapping": {"hips": "Hips"}}, "humanoid_contract_missing:legacy_mapping_only"),
+            ("bone_profile", {"humanoid_profile": {"roles": {"hips": "bone_0", "left_foot": "bone_12"}}}, "humanoid_contract_missing:bone_profile_only"),
+        ]
+        for case_name, sidecar_payload, expected_diagnostic in cases:
+            with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as tmp:
+                outputs = Path(tmp) / "outputs"
+                rig = Path(tmp) / f"{case_name}.gltf"
+                shutil.copyfile(FIXTURES / "tiny_rigged.gltf", rig)
+                if isinstance(sidecar_payload, str):
+                    rig.with_suffix(".rigmeta.json").write_text(sidecar_payload, encoding="utf-8")
+                elif sidecar_payload is not None:
+                    rig.with_suffix(".rigmeta.json").write_text(json.dumps(sidecar_payload), encoding="utf-8")
+                instance = KimodoGenerator(Path(tmp) / "model", outputs)
+                instance._loaded = True
+
+                with self._patched_runtime(run_side_effect=self._write_motion_bundle):
+                    animated = instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(rig)})
+
+                metadata = json.loads((animated.parent / "metadata.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(metadata["retarget_status"], "success")
+            self.assertEqual(metadata["runtime_status"], "success")
+            self.assertEqual(metadata["contract_status"], "contract_missing_or_untrusted")
+            self.assertEqual(metadata["stabilization_status"], "not_evaluated")
+            if expected_diagnostic is None:
+                self.assertNotIn("humanoid_contract", metadata["diagnostics"])
+            else:
+                contract = metadata["diagnostics"]["humanoid_contract"]
+                self.assertFalse(contract["trusted"])
+                self.assertIn(expected_diagnostic, contract["diagnostics"])
 
     def test_generate_animate_rigged_mesh_preserves_unknown_best_effort_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,7 +372,7 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
         self.assertEqual(metadata["diagnostics"]["rigged_mesh_path"], str(bad_rig))
         self.assertFalse((bundle / "animated.glb").exists())
 
-    def test_generate_animate_rigged_mesh_reports_mapping_incompatible_code(self):
+    def test_generate_animate_rigged_mesh_returns_preview_fallback_for_mapping_incompatible(self):
         with tempfile.TemporaryDirectory() as tmp:
             incompatible_rig = Path(tmp) / "tail.gltf"
             incompatible_rig.write_text(
@@ -341,18 +384,52 @@ class GeneratorRiggedMeshTests(unittest.TestCase):
             instance._loaded = True
 
             with self._patched_runtime(run_side_effect=self._write_motion_bundle):
-                with self.assertRaises(KimodoRuntimeError) as ctx:
-                    instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(incompatible_rig)})
+                fallback = instance.generate(b"", {**self.base_params(), "rigged_mesh_path": str(incompatible_rig)})
 
             bundle = next(outputs.iterdir())
             metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+            preview_exists = (bundle / "preview.glb").exists()
+            animated_exists = (bundle / "animated.glb").exists()
+
+        self.assertEqual(fallback.name, "preview.glb")
+        self.assertEqual(metadata["retarget_status"], "failed")
+        self.assertEqual(metadata["runtime_status"], "success_with_fallback")
+        self.assertEqual(metadata["retarget_error_code"], "MAPPING_INCOMPATIBLE")
+        self.assertEqual(metadata["retarget_error_aliases"], [])
+        self.assertEqual(metadata["stabilization_status"], "not_evaluated")
+        self.assertEqual(metadata["fallback_output"], "preview.glb")
+        self.assertEqual(metadata["fallback_reason"], "retarget_mapping_incompatible")
+        self.assertEqual(metadata["diagnostics"]["rigged_mesh_path"], str(incompatible_rig))
+        self.assertTrue(preview_exists)
+        self.assertFalse(animated_exists)
+
+    def test_retarget_motion_bundle_still_raises_mapping_incompatible_without_safe_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            metadata_path = bundle / "metadata.json"
+            metadata_path.write_text(json.dumps({"canonical_motion_artifact": "motion.npz"}), encoding="utf-8")
+            (bundle / "motion.npz").write_bytes(b"npz")
+            (bundle / "motion.bvh").write_text((FIXTURES / "synthetic_walk.bvh").read_text(encoding="utf-8"), encoding="utf-8")
+            incompatible_rig = bundle / "tail.gltf"
+            incompatible_rig.write_text(
+                '{"asset":{"version":"2.0"},"nodes":[{"name":"Tail"}],"skins":[{"joints":[0]}]}',
+                encoding="utf-8",
+            )
+            request = {"rigged_mesh_path": incompatible_rig, "rigged_mesh_source_kind": "unknown_mesh_source", "prompt": "Walk forward"}
+            completed = {"output_stem_name": "motion", "num_samples": 1}
+
+            with self.assertRaises(KimodoRuntimeError) as ctx:
+                generator.retarget_motion_bundle(bundle, metadata_path, request, completed)
+
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            animated_exists = (bundle / "animated.glb").exists()
 
         self.assertEqual(ctx.exception.code, "MAPPING_INCOMPATIBLE")
         self.assertEqual(metadata["retarget_status"], "failed")
         self.assertEqual(metadata["retarget_error_code"], "MAPPING_INCOMPATIBLE")
-        self.assertEqual(metadata["retarget_error_aliases"], [])
-        self.assertEqual(metadata["diagnostics"]["rigged_mesh_path"], str(incompatible_rig))
-        self.assertFalse((bundle / "animated.glb").exists())
+        self.assertNotIn("runtime_status", metadata)
+        self.assertNotIn("fallback_output", metadata)
+        self.assertFalse(animated_exists)
 
     def test_generate_animate_rigged_mesh_reports_export_failed_code(self):
         with tempfile.TemporaryDirectory() as tmp:

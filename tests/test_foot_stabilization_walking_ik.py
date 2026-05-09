@@ -22,15 +22,23 @@ def _channel(target, path, values, role):
 
 
 def _clip(*channels):
+    root_values = tuple(channels[0].values) if channels else ()
+    foot_samples = {
+        "status": "success",
+        "samples": {
+            "left": tuple((value[0] - 0.2, value[1], value[2] + 0.3) for value in root_values),
+            "right": tuple((value[0] + 0.2, value[1], value[2] + 0.3) for value in root_values),
+        },
+    }
     return RetargetClip(
         name="Kimodo Walking",
         duration=0.2,
         frame_time=1.0 / 30.0,
-        root_translations=tuple(channels[0].values) if channels else (),
+        root_translations=root_values,
         channels=tuple(channels),
         mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
         warnings=(),
-        calibration={"locomotion_policy": {"detected_locomotion": True}},
+        calibration={"locomotion_policy": {"detected_locomotion": True}, "pre_export_foot_samples": foot_samples},
         visual_quality={"version": "kimodo.visual_quality.v1", "blocking": False, "warnings": [], "limitations": [], "checks": {}},
     )
 
@@ -82,6 +90,7 @@ def _rig(*, rest=None, basis=None, chains=None):
             }
         },
         humanoid_basis_hints=basis if basis is not None else {"up_axis": "Y", "knee_plane_normal": [0.0, 0.0, 1.0]},
+        contract_status="trusted",
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from kimodo_bvh import BvhMotion
 from retarget_errors import CALIBRATION_UNAVAILABLE, MAPPING_INCOMPATIBLE, RetargetError
@@ -232,6 +233,105 @@ def load_motion_context(path: Path | str | None) -> MotionContext | None:
         return MotionContext(path=npz_path, source_keys=(), warnings=(f"motion_context_load_failed:{type(exc).__name__}",))
 
 
+def sample_pre_export_foot_nodes(clip: RetargetClip, rig: RigInspection) -> dict[str, Any]:
+    frame_count = len(clip.root_translations)
+    if getattr(rig, "contract_status", "contract_missing_or_untrusted") != "trusted":
+        return _pre_export_foot_sample_skip("contract_missing_or_untrusted", frame_count=frame_count)
+    if frame_count <= 0:
+        return _pre_export_foot_sample_skip("missing_frame_domain", frame_count=0)
+    if not _has_required_sample_leg_chains(rig):
+        return _pre_export_foot_sample_skip("missing_valid_leg_chains", frame_count=frame_count)
+    hierarchy_samples = _sample_foot_nodes_from_local_hierarchy(clip, rig)
+    if hierarchy_samples is not None:
+        left, right = hierarchy_samples
+        if left == tuple(clip.root_translations) and right == tuple(clip.root_translations):
+            return _pre_export_foot_sample_skip("root_proxy_foot_samples_rejected", frame_count=frame_count)
+        return {
+            "status": "success",
+            "reason": None,
+            "frame_count": frame_count,
+            "frame_time": _clean_float(clip.frame_time),
+            "samples": {"left": left, "right": right},
+            "bindings": {"left": "left_foot", "right": "right_foot"},
+            "source": "retarget_clip_trs",
+            "warnings": [],
+        }
+    if _has_local_foot_rest_without_usable_hierarchy(rig):
+        return _pre_export_foot_sample_skip("insufficient_hierarchy_or_rotation_evidence", frame_count=frame_count)
+    left_rest = _foot_rest_translation(rig, "left_foot")
+    right_rest = _foot_rest_translation(rig, "right_foot")
+    if left_rest is None or right_rest is None:
+        return _pre_export_foot_sample_skip("missing_trusted_foot_rest_transforms", frame_count=frame_count)
+    if left_rest == (0.0, 0.0, 0.0) and right_rest == (0.0, 0.0, 0.0):
+        return _pre_export_foot_sample_skip("root_proxy_foot_samples_rejected", frame_count=frame_count)
+    left = tuple(_add_vec3(root, left_rest) for root in clip.root_translations)
+    right = tuple(_add_vec3(root, right_rest) for root in clip.root_translations)
+    if left == tuple(clip.root_translations) and right == tuple(clip.root_translations):
+        return _pre_export_foot_sample_skip("root_proxy_foot_samples_rejected", frame_count=frame_count)
+    return {
+        "status": "success",
+        "reason": None,
+        "frame_count": frame_count,
+        "frame_time": _clean_float(clip.frame_time),
+        "samples": {"left": left, "right": right},
+        "bindings": {"left": "left_foot", "right": "right_foot"},
+        "source": "retarget_clip_trs",
+        "warnings": [],
+    }
+
+
+def _sample_foot_nodes_from_local_hierarchy(
+    clip: RetargetClip,
+    rig: RigInspection,
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]] | None:
+    role_to_node = {binding.role: binding.node_name for binding in getattr(rig, "humanoid_roles", ())}
+    hips = role_to_node.get("hips")
+    left_foot = role_to_node.get("left_foot")
+    right_foot = role_to_node.get("right_foot")
+    if hips is None or left_foot is None or right_foot is None:
+        return None
+    parent_by_node = _parent_map_from_joint_children(getattr(rig, "joint_children", ()))
+    if not parent_by_node:
+        return None
+    if not _is_descendant(left_foot, hips, parent_by_node) or not _is_descendant(right_foot, hips, parent_by_node):
+        return None
+    local_translations = _local_translations_by_node(rig, role_to_node)
+    for role in ("left_upper_leg", "left_lower_leg", "left_foot", "right_upper_leg", "right_lower_leg", "right_foot"):
+        node_name = role_to_node.get(role)
+        if node_name is None or node_name not in local_translations:
+            return None
+    rotations = _rotation_samples_by_node(clip)
+    ordered_nodes = _topological_nodes_from_root(hips, parent_by_node)
+    if left_foot not in ordered_nodes or right_foot not in ordered_nodes:
+        return None
+    left_samples: list[tuple[float, float, float]] = []
+    right_samples: list[tuple[float, float, float]] = []
+    identity = (0.0, 0.0, 0.0, 1.0)
+    for frame_index, root_translation in enumerate(clip.root_translations):
+        positions: dict[str, tuple[float, float, float]] = {hips: tuple(_clean_float(value) for value in root_translation)}
+        world_rotations: dict[str, tuple[float, float, float, float]] = {}
+        root_rotation = _rotation_sample_for_node(rotations, hips, frame_index) or identity
+        world_rotations[hips] = root_rotation
+        for node_name in ordered_nodes:
+            if node_name == hips:
+                continue
+            parent = parent_by_node.get(node_name)
+            if parent not in positions or parent not in world_rotations:
+                continue
+            local_translation = local_translations.get(node_name)
+            if local_translation is None:
+                continue
+            parent_rotation = world_rotations[parent]
+            positions[node_name] = _add_vec3(positions[parent], _rotate_vec3(parent_rotation, local_translation))
+            local_rotation = _rotation_sample_for_node(rotations, node_name, frame_index) or identity
+            world_rotations[node_name] = _normalize_quaternion_xyzw(_multiply_quaternion_xyzw(parent_rotation, local_rotation))
+        if left_foot not in positions or right_foot not in positions:
+            return None
+        left_samples.append(positions[left_foot])
+        right_samples.append(positions[right_foot])
+    return tuple(left_samples), tuple(right_samples)
+
+
 def build_joint_mapping(source: BvhMotion, target: RigInspection) -> JointMapping:
     source_lookup = {_normalize(name): name for name in source.joints}
     calibrated_mapping = _build_calibrated_contract_mapping(source, source_lookup, target)
@@ -365,6 +465,20 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
         warnings=warnings,
         calibration=calibration,
     )
+    pre_export_foot_samples = sample_pre_export_foot_nodes(clip, target)
+    if getattr(target, "contract_status", "contract_missing_or_untrusted") == "trusted":
+        calibration = dict(calibration)
+        calibration["pre_export_foot_samples"] = pre_export_foot_samples
+        clip = RetargetClip(
+            name=clip.name,
+            duration=clip.duration,
+            frame_time=clip.frame_time,
+            root_translations=clip.root_translations,
+            channels=clip.channels,
+            mapping=clip.mapping,
+            warnings=clip.warnings,
+            calibration=calibration,
+        )
     return RetargetClip(
         name=clip.name,
         duration=clip.duration,
@@ -379,6 +493,8 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
 
 
 def _build_calibrated_contract_mapping(source: BvhMotion, source_lookup: dict[str, str], target: RigInspection) -> JointMapping | None:
+    if getattr(target, "contract_status", "trusted") != "trusted":
+        return None
     if target.humanoid_contract_path is None and not target.humanoid_contract_schema:
         return None
     if target.humanoid_contract_schema != HUMANOID_CONTRACT_SCHEMA:
@@ -1835,6 +1951,162 @@ def _clean_float(value: float) -> float:
 
 def _unique_list(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+def _pre_export_foot_sample_skip(reason: str, *, frame_count: int) -> dict[str, Any]:
+    warnings = ["pre_export_foot_sampling/root_proxy_not_trusted"] if reason in {"missing_trusted_foot_rest_transforms", "root_proxy_foot_samples_rejected"} else []
+    return {
+        "status": "not_evaluated",
+        "reason": reason,
+        "frame_count": frame_count,
+        "frame_time": None,
+        "samples": {},
+        "bindings": {},
+        "source": "retarget_clip_trs",
+        "warnings": warnings,
+    }
+
+
+def _has_required_sample_leg_chains(rig: RigInspection) -> bool:
+    chain_by_name = {chain.name: chain.roles for chain in getattr(rig, "humanoid_chains", ())}
+    return chain_by_name.get("left_leg") == ("left_upper_leg", "left_lower_leg", "left_foot") and chain_by_name.get("right_leg") == ("right_upper_leg", "right_lower_leg", "right_foot")
+
+
+def _parent_map_from_joint_children(joint_children: tuple[tuple[str, tuple[str, ...]], ...]) -> dict[str, str]:
+    parents: dict[str, str] = {}
+    for parent, children in joint_children:
+        for child in children:
+            parents[str(child)] = str(parent)
+    return parents
+
+
+def _is_descendant(node: str, ancestor: str, parent_by_node: dict[str, str]) -> bool:
+    current = node
+    visited: set[str] = set()
+    while current in parent_by_node and current not in visited:
+        visited.add(current)
+        current = parent_by_node[current]
+        if current == ancestor:
+            return True
+    return node == ancestor
+
+
+def _topological_nodes_from_root(root: str, parent_by_node: dict[str, str]) -> tuple[str, ...]:
+    children_by_parent: dict[str, list[str]] = {}
+    for child, parent in parent_by_node.items():
+        children_by_parent.setdefault(parent, []).append(child)
+    ordered: list[str] = []
+    stack = [root]
+    while stack:
+        node = stack.pop(0)
+        ordered.append(node)
+        stack.extend(children_by_parent.get(node, ()))
+    return tuple(dict.fromkeys(ordered))
+
+
+def _local_translations_by_node(rig: RigInspection, role_to_node: dict[str, str]) -> dict[str, tuple[float, float, float]]:
+    rest = getattr(rig, "humanoid_rest", {}) or {}
+    roles = rest.get("roles") if isinstance(rest, dict) else None
+    if not isinstance(roles, dict):
+        return {}
+    translations: dict[str, tuple[float, float, float]] = {}
+    for role, node_name in role_to_node.items():
+        entry = roles.get(role)
+        if not isinstance(entry, dict):
+            continue
+        parsed = _parse_vec3(entry.get("local_translation"))
+        if parsed is None:
+            matrix = _parse_matrix4(entry.get("rest_local"))
+            parsed = _matrix_translation(matrix)
+        if parsed is not None:
+            translations[node_name] = parsed
+    return translations
+
+
+def _matrix_translation(matrix: tuple[tuple[float, float, float, float], ...] | None) -> tuple[float, float, float] | None:
+    if matrix is None:
+        return None
+    return (_clean_float(matrix[0][3]), _clean_float(matrix[1][3]), _clean_float(matrix[2][3]))
+
+
+def _rotation_samples_by_node(clip: RetargetClip) -> dict[str, tuple[tuple[float, float, float, float], ...]]:
+    rotations: dict[str, tuple[tuple[float, float, float, float], ...]] = {}
+    for channel in clip.channels:
+        if channel.path != "rotation":
+            continue
+        samples: list[tuple[float, float, float, float]] = []
+        for value in channel.values:
+            parsed = _parse_quaternion(value)
+            if parsed is None:
+                samples = []
+                break
+            samples.append(parsed)
+        if samples:
+            rotations[channel.target_joint] = tuple(samples)
+    return rotations
+
+
+def _rotation_sample_for_node(
+    rotations: dict[str, tuple[tuple[float, float, float, float], ...]],
+    node_name: str,
+    frame_index: int,
+) -> tuple[float, float, float, float] | None:
+    samples = rotations.get(node_name)
+    if samples is None or frame_index >= len(samples):
+        return None
+    return samples[frame_index]
+
+
+def _rotate_vec3(quaternion: tuple[float, float, float, float], vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    q_vector = (vector[0], vector[1], vector[2], 0.0)
+    rotated = _multiply_quaternion_xyzw(_multiply_quaternion_xyzw(quaternion, q_vector), _inverse_quaternion_xyzw(quaternion))
+    return (_clean_float(rotated[0]), _clean_float(rotated[1]), _clean_float(rotated[2]))
+
+
+def _has_local_foot_rest_without_usable_hierarchy(rig: RigInspection) -> bool:
+    rest = getattr(rig, "humanoid_rest", {}) or {}
+    roles = rest.get("roles") if isinstance(rest, dict) else None
+    if not isinstance(roles, dict):
+        return False
+    has_local_foot = False
+    for role in ("left_foot", "right_foot"):
+        entry = roles.get(role)
+        if isinstance(entry, dict) and (_parse_vec3(entry.get("local_translation")) is not None or _parse_matrix4(entry.get("rest_local")) is not None):
+            has_local_foot = True
+    return has_local_foot and not _parent_map_from_joint_children(getattr(rig, "joint_children", ()))
+
+
+def _foot_rest_translation(rig: RigInspection, role: str) -> tuple[float, float, float] | None:
+    rest = getattr(rig, "humanoid_rest", {}) or {}
+    if not isinstance(rest, dict):
+        return None
+    roles = rest.get("roles")
+    if not isinstance(roles, dict):
+        return None
+    entry = roles.get(role)
+    if not isinstance(entry, dict):
+        return None
+    for key in ("world_translation", "local_translation"):
+        parsed = _parse_vec3(entry.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_vec3(value: Any) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    try:
+        parsed = (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(component) for component in parsed):
+        return None
+    return tuple(_clean_float(component) for component in parsed)
+
+
+def _add_vec3(left: tuple[float, float, float], right: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (_clean_float(left[0] + right[0]), _clean_float(left[1] + right[1]), _clean_float(left[2] + right[2]))
 
 
 def _root_motion_target(source: BvhMotion, mapping: JointMapping) -> str | None:
