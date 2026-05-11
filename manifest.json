@@ -140,11 +140,13 @@
       "inputs": [
         {
           "name": "prompt",
+          "label": "Prompt",
           "type": "text",
           "required": true
         },
         {
           "name": "rigged_mesh",
+          "label": "Rigged Mesh",
           "type": "mesh",
           "required": true
         }
