@@ -37,10 +37,20 @@ KIMODO_RUNTIME_DEPENDENCIES = [
 ]
 
 
-def venv_python(venv_dir: Path) -> Path:
+def managed_bin_dir(venv_dir: Path) -> Path:
     if platform.system() == "Windows":
-        return venv_dir / "Scripts" / "python.exe"
-    return venv_dir / "bin" / "python"
+        return venv_dir / "Scripts"
+    return venv_dir / "bin"
+
+
+def venv_python(venv_dir: Path) -> Path:
+    executable = "python.exe" if platform.system() == "Windows" else "python"
+    return managed_bin_dir(venv_dir) / executable
+
+
+def venv_pip(venv_dir: Path) -> Path:
+    executable = "pip.exe" if platform.system() == "Windows" else "pip"
+    return managed_bin_dir(venv_dir) / executable
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> None:

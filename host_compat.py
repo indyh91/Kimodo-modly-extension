@@ -17,6 +17,7 @@ UNSUPPORTED = "unsupported"
 
 X86_CU124_LANE = "linux-x86_64-cu124"
 X86_CU128_LANE = "linux-x86_64-cu128"
+WINDOWS_X86_CU124_LANE = "windows-x86_64-cu124"
 ARM64_CU124_LANE = "linux-arm64-cu124"
 ARM64_CU128_LANE = "linux-arm64-cu128"
 
@@ -101,7 +102,7 @@ class HostCompatibility:
 
 def normalize_machine(raw: str) -> str:
     value = raw.strip().lower()
-    if value in {"amd64", "x64"}:
+    if value in {"amd64", "x64", "x86-64"}:
         return "x86_64"
     if value == "aarch64":
         return "arm64"
@@ -228,16 +229,7 @@ def classify_host(facts: HostFacts) -> HostCompatibility:
     if facts.platform_key == "linux/arm64":
         return _classify_linux_arm64(facts)
     if facts.platform_key == "windows/x86_64":
-        return HostCompatibility(
-            state=UNSUPPORTED,
-            platform_key=facts.platform_key,
-            lane=None,
-            reason="Windows x86_64 remains outside the validated runtime-core and host-compat scope for Kimodo in this repository.",
-            torch_index=None,
-            torch_packages=(),
-            wheel_urls=(),
-            notes=("Upstream Kimodo mentions Windows, but this extension has no validated Windows runtime path yet.",),
-        )
+        return _classify_windows_x86_64(facts)
     return HostCompatibility(
         state=UNSUPPORTED,
         platform_key=facts.platform_key,
@@ -314,6 +306,58 @@ def _classify_linux_x86_64(facts: HostFacts) -> HostCompatibility:
         torch_packages=(),
         wheel_urls=(),
         notes=(),
+    )
+
+
+def _classify_windows_x86_64(facts: HostFacts) -> HostCompatibility:
+    if facts.gpu_sm >= 70 and (facts.cuda_version == 0 or facts.cuda_version >= 124):
+        reason = "Windows x86_64 + NVIDIA SM 70+ is allowed through an experimental Kimodo runtime lane."
+        if facts.cuda_version == 0:
+            reason = (
+                "Windows x86_64 + NVIDIA SM 70+ is treated as experimental; CUDA version was not detected so cu124 is selected conservatively."
+            )
+        return HostCompatibility(
+            state=EXPERIMENTAL,
+            platform_key=facts.platform_key,
+            lane=WINDOWS_X86_CU124_LANE,
+            reason=reason,
+            torch_index=CU124_INDEX,
+            torch_packages=X86_CU124_PACKAGES,
+            wheel_urls=(),
+            notes=(
+                "Windows x86_64 is experimental and has not been validated on a real Windows host.",
+                "Setup can still fail on Windows because of CUDA, PyTorch, DLL loading, or gated model access.",
+                "Postprocess remains disabled in runtime-core regardless of host lane.",
+            ),
+        )
+
+    if facts.gpu_sm >= 70:
+        return HostCompatibility(
+            state=UNSUPPORTED,
+            platform_key=facts.platform_key,
+            lane=None,
+            reason=(
+                "Windows x86_64 host has a usable NVIDIA GPU, but the detected CUDA driver/toolkit is below the modeled cu124 baseline for the experimental lane. "
+                f"Received gpu_sm={facts.gpu_sm} cuda_version={facts.cuda_version or 'unknown'}."
+            ),
+            torch_index=None,
+            torch_packages=(),
+            wheel_urls=(),
+            notes=("Windows x86_64 is not validated; the experimental lane requires the modeled cu124 baseline.",),
+        )
+
+    return HostCompatibility(
+        state=UNSUPPORTED,
+        platform_key=facts.platform_key,
+        lane=None,
+        reason=(
+            "Windows x86_64 compatibility for Kimodo is only modeled experimentally for NVIDIA CUDA hosts with GPU SM >= 70. "
+            f"Received gpu_sm={facts.gpu_sm or 'unknown'} on {facts.platform_key}."
+        ),
+        torch_index=None,
+        torch_packages=(),
+        wheel_urls=(),
+        notes=("Windows x86_64 is experimental, not validated support, and is not expanded beyond the modeled NVIDIA CUDA lane.",),
     )
 
 

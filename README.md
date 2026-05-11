@@ -21,9 +21,11 @@ What is wired today:
 
 - Modly with extension support.
 - A Hugging Face token configured in Modly. Kimodo depends on gated Hugging Face resources.
+- Kimodo's text encoder uses LLM2Vec on top of Meta Llama 3: `McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp`, `McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised`, and `meta-llama/Meta-Llama-3-8B-Instruct`. Before first use, sign in to Hugging Face with the token used by Modly and accept or request the required Meta Llama 3 access conditions before download; otherwise encoder/model download can fail even when Kimodo itself is installed.
 - NVIDIA GPU runtime.
 - Linux x86_64 is the intended supported baseline.
 - Linux arm64 + NVIDIA Blackwell/CUDA is currently an **experimental** host lane, validated locally on NVIDIA GB10 with pinned PyTorch ARM64 CUDA wheels.
+- Windows x86_64 is available as an experimental compatibility lane. The setup path is unit-tested for Windows-style virtualenv paths, but native Windows CUDA/PyTorch/DLL execution has not yet been validated by this repository.
 
 ## Install and Download Flow
 
@@ -36,6 +38,8 @@ The important split is intentional:
 
 - `setup.py` installs the Python runtime and Kimodo package dependencies.
 - Modly's **Download** button owns model weights.
+
+Gated encoder access is separate from the Kimodo SOMA RP weight download: Hugging Face/Meta access conditions for the LLM2Vec and Meta Llama 3 repositories must be accepted or requested before the first encoder/model download.
 
 Do not run setup from the source repository when validating Modly behavior. Install, repair, staging, and extension directory placement are owned by Modly's extension-management flow, not by this repository's source tree.
 
@@ -60,8 +64,10 @@ Do not run setup from the source repository when validating Modly behavior. Inst
 - Full Kimodo feature parity is not implemented yet.
 - Motion postprocess is disabled in this runtime-core baseline because MotionCorrection is intentionally skipped during setup.
 - Linux arm64 support is best-effort and must not be treated as parity with the main Linux x86_64 baseline.
+- Windows setup can still fail because of CUDA, PyTorch, DLL loading, or gated model access; those are known experimental-lane risk categories, not evidence that native Windows runtime execution has been validated.
 - The current `Animate Rigged Mesh` MVP only authors a root-translation animation channel. Full joint rotations, rest-pose correction, axis conversion beyond recorded assumptions, scale handling, and visual-quality validation are deferred.
 - Structurally real animation data does not mean production-quality retargeting. The GLB can contain a valid `Kimodo Motion` clip while still looking wrong for rigs outside the supported humanoid path.
+- Future research: evaluate alternative text encoders or external encoder service paths to reduce gated-model friction, VRAM pressure, or Windows-specific runtime risk. No alternative encoder implementation is part of this repository state.
 
 ## Rigging and Retargeting Direction
 
