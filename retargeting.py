@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from kimodo_bvh import BvhMotion
+from limb_swing_plane import diagnose_limb_swing_plane
+from locomotion_axis import apply_root_axis_correction, diagnose_locomotion_axes, plan_root_axis_correction
 from retarget_errors import CALIBRATION_UNAVAILABLE, MAPPING_INCOMPATIBLE, RetargetError
 from rig_inspector import HUMANOID_CONTRACT_SCHEMA, REQUIRED_HUMANOID_CHAINS, RigInspection
 
@@ -499,6 +501,12 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
     if locomotion_policy["mode"] == "preserve_scaled_npz_root_motion" and motion_context is not None:
         translations = list(motion_context.root_deltas(frame_count=len(source.frames)))
         root_motion_source_label = str(locomotion_policy["source"])
+    locomotion_axis_diagnostics = _safe_locomotion_axis_diagnostics(target, motion_context=motion_context)
+    if locomotion_axis_diagnostics is not None:
+        locomotion_axis_diagnostics, translations = _safe_apply_root_axis_correction_to_translations(
+            locomotion_axis_diagnostics,
+            translations,
+        )
     channels: list[RetargetChannel] = []
     if root_target is not None:
         diagnostics = {
@@ -540,6 +548,8 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
     warnings = _unique_tuple(mapping.warnings + target.warnings + tuple(root_motion_warnings))
     calibration = _calibration_metadata(target, mapping) if mapping.confidence == "calibrated" else {}
     calibration["locomotion_policy"] = locomotion_policy
+    if locomotion_axis_diagnostics is not None:
+        calibration["locomotion_axis_alignment"] = locomotion_axis_diagnostics
     contact_locking_diagnostics = _contact_locking_metadata_for_context(motion_context, frame_count=len(source.frames))
     if contact_locking_diagnostics is not None:
         calibration["contact_aware_foot_locking"] = contact_locking_diagnostics
@@ -560,19 +570,25 @@ def build_retarget_clip(source: BvhMotion, target: RigInspection, motion_context
         calibration=calibration,
     )
     pre_export_foot_samples = sample_pre_export_foot_nodes(clip, target)
+    calibration = dict(calibration)
     if getattr(target, "contract_status", "contract_missing_or_untrusted") == "trusted":
-        calibration = dict(calibration)
         calibration["pre_export_foot_samples"] = pre_export_foot_samples
-        clip = RetargetClip(
-            name=clip.name,
-            duration=clip.duration,
-            frame_time=clip.frame_time,
-            root_translations=clip.root_translations,
-            channels=clip.channels,
-            mapping=clip.mapping,
-            warnings=clip.warnings,
-            calibration=calibration,
-        )
+    calibration["limb_swing_plane"] = _safe_limb_swing_plane_diagnostics(
+        clip,
+        target,
+        pre_export_foot_samples=pre_export_foot_samples,
+        motion_context=motion_context,
+    )
+    clip = RetargetClip(
+        name=clip.name,
+        duration=clip.duration,
+        frame_time=clip.frame_time,
+        root_translations=clip.root_translations,
+        channels=clip.channels,
+        mapping=clip.mapping,
+        warnings=clip.warnings,
+        calibration=calibration,
+    )
     return RetargetClip(
         name=clip.name,
         duration=clip.duration,
@@ -1289,6 +1305,9 @@ def visual_quality_diagnostics(
     }
     if euler_advisories:
         checks["euler_wrap_advisory"] = euler_advisories
+    locomotion_axis_alignment = (clip.calibration or {}).get("locomotion_axis_alignment")
+    if isinstance(locomotion_axis_alignment, dict):
+        checks["locomotion_axis_alignment"] = locomotion_axis_alignment
     return {
         "version": VISUAL_QUALITY_VERSION,
         "blocking": False,
@@ -1321,6 +1340,300 @@ def _safe_visual_quality_diagnostics(clip: RetargetClip, *, motion_context: Moti
             },
             "reason": f"{type(exc).__name__}: {exc}",
         }
+
+
+def _safe_locomotion_axis_diagnostics(target: RigInspection, *, motion_context: MotionContext | None) -> dict[str, object] | None:
+    try:
+        contract_basis = _locomotion_axis_contract_basis(target)
+        if contract_basis is None and motion_context is None:
+            return None
+        return diagnose_locomotion_axes(
+            root_positions=motion_context.root_samples if motion_context is not None else None,
+            contract_basis=contract_basis,
+            facing_vectors=None,
+            foot_positions=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never block retargeting
+        return {
+            "schema": "kimodo.locomotion_axis.diagnostics.v1",
+            "status": "not_evaluated",
+            "contract_forward": None,
+            "contract_up": None,
+            "handedness": None,
+            "root_advance": _locomotion_axis_missing_stream("root_advance", "diagnostics/not_evaluated"),
+            "hips_facing": _locomotion_axis_missing_stream("hips_facing", "diagnostics/not_evaluated"),
+            "swing_plane": _locomotion_axis_missing_stream("swing_plane", "diagnostics/not_evaluated"),
+            "streams": {},
+            "classification": "unknown",
+            "correction_eligible": False,
+            "correction": {
+                "status": "skipped",
+                "eligible": False,
+                "applied_channels": [],
+                "confidence": 0.0,
+                "skip_reason": "diagnostics_not_evaluated",
+            },
+            "reasons": [{"code": "diagnostics/not_evaluated", "detail": f"{type(exc).__name__}: {exc}"}],
+            "warnings": [{"code": "locomotion_axis/diagnostics_not_evaluated"}],
+        }
+
+
+def _safe_limb_swing_plane_diagnostics(
+    clip: RetargetClip,
+    target: RigInspection,
+    *,
+    pre_export_foot_samples: dict[str, Any],
+    motion_context: MotionContext | None,
+) -> dict[str, object]:
+    try:
+        samples = pre_export_foot_samples.get("samples") if isinstance(pre_export_foot_samples, dict) else {}
+        sample_payload = samples if isinstance(samples, dict) else {}
+        root_positions = _limb_swing_root_positions(clip, motion_context=motion_context)
+        hips_positions = tuple(clip.root_translations)
+        left_foot_positions = sample_payload.get("left") if pre_export_foot_samples.get("status") == "success" else None
+        right_foot_positions = sample_payload.get("right") if pre_export_foot_samples.get("status") == "success" else None
+        diagnostics = diagnose_limb_swing_plane(
+            root_positions=root_positions,
+            hips_positions=hips_positions,
+            left_foot_positions=left_foot_positions,
+            right_foot_positions=right_foot_positions,
+            basis=_locomotion_axis_contract_basis(target),
+            mirror_evidence=_limb_swing_mirror_evidence(target, pre_export_foot_samples=pre_export_foot_samples, hips_positions=hips_positions),
+            chain_evidence=_limb_swing_chain_evidence(target),
+        )
+        return _annotate_limb_swing_plane_diagnostics(diagnostics, pre_export_foot_samples)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never block retargeting
+        fallback = diagnose_limb_swing_plane(
+            root_positions=None,
+            hips_positions=None,
+            left_foot_positions=None,
+            right_foot_positions=None,
+            basis=_locomotion_axis_contract_basis(target),
+            mirror_evidence=_limb_swing_mirror_evidence(target, pre_export_foot_samples=pre_export_foot_samples, hips_positions=()),
+            chain_evidence=_limb_swing_chain_evidence(target),
+        )
+        fallback = _annotate_limb_swing_plane_diagnostics(fallback, pre_export_foot_samples)
+        reasons = list(fallback.get("reasons", [])) if isinstance(fallback.get("reasons"), list) else []
+        reasons.append({"code": "diagnostics/not_evaluated", "detail": f"{type(exc).__name__}: {exc}"})
+        fallback["reasons"] = reasons
+        warnings = list(fallback.get("warnings", [])) if isinstance(fallback.get("warnings"), list) else []
+        warnings.append("limb_swing_plane/diagnostics_not_evaluated")
+        fallback["warnings"] = _unique_list([str(warning) for warning in warnings])
+        return fallback
+
+
+def _limb_swing_root_positions(clip: RetargetClip, *, motion_context: MotionContext | None) -> tuple[tuple[float, float, float], ...]:
+    if motion_context is not None and motion_context.root_samples is not None and len(motion_context.root_samples) == len(clip.root_translations):
+        return tuple(motion_context.root_samples)
+    return tuple(clip.root_translations)
+
+
+def _limb_swing_mirror_evidence(
+    target: RigInspection,
+    *,
+    pre_export_foot_samples: dict[str, Any],
+    hips_positions: tuple[tuple[float, float, float], ...],
+) -> dict[str, object]:
+    left_roles = _limb_swing_chain_roles(target, "left_leg")
+    right_roles = _limb_swing_chain_roles(target, "right_leg")
+    signs = _limb_swing_rest_side_signs(pre_export_foot_samples, hips_positions=hips_positions)
+    status = "passed" if left_roles and right_roles and signs.get("left") == -1 and signs.get("right") == 1 else "failed"
+    return {
+        "status": status,
+        "left_chain_roles": left_roles,
+        "right_chain_roles": right_roles,
+        "rest_side_signs": signs,
+    }
+
+
+def _limb_swing_chain_evidence(target: RigInspection) -> dict[str, object]:
+    left_roles = _limb_swing_chain_roles(target, "left_leg")
+    right_roles = _limb_swing_chain_roles(target, "right_leg")
+    role_names = {binding.role for binding in getattr(target, "humanoid_roles", ())}
+    feet_present = {"left_foot", "right_foot"}.issubset(role_names)
+    toes_present = {"left_toes", "right_toes"}.issubset(role_names)
+    ordered = bool(left_roles and right_roles)
+    status = "passed" if ordered and feet_present and toes_present else "failed"
+    return {
+        "status": status,
+        "left_chain_roles": left_roles,
+        "right_chain_roles": right_roles,
+        "ordered": ordered,
+        "feet_present": feet_present,
+        "toes_present": toes_present,
+    }
+
+
+def _limb_swing_chain_roles(target: RigInspection, chain_name: str) -> list[str]:
+    for chain in getattr(target, "humanoid_chains", ()):
+        if chain.name == chain_name:
+            return [str(role) for role in chain.roles]
+    return []
+
+
+def _limb_swing_rest_side_signs(
+    pre_export_foot_samples: dict[str, Any],
+    *,
+    hips_positions: tuple[tuple[float, float, float], ...],
+) -> dict[str, float | None]:
+    samples = pre_export_foot_samples.get("samples") if isinstance(pre_export_foot_samples, dict) else {}
+    if not isinstance(samples, dict) or not hips_positions:
+        return {"left": None, "right": None}
+    return {
+        "left": _limb_swing_initial_lateral(samples.get("left"), hips_positions),
+        "right": _limb_swing_initial_lateral(samples.get("right"), hips_positions),
+    }
+
+
+def _limb_swing_initial_lateral(positions: Any, hips_positions: tuple[tuple[float, float, float], ...]) -> float | None:
+    try:
+        if not positions:
+            return None
+        return _clean_float(float(positions[0][0]) - float(hips_positions[0][0]))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _annotate_limb_swing_plane_diagnostics(diagnostics: dict[str, Any], pre_export_foot_samples: dict[str, Any]) -> dict[str, object]:
+    annotated = dict(diagnostics)
+    annotated["diagnostic_source"] = "pre_export_foot_samples"
+    annotated["pre_export_foot_samples"] = pre_export_foot_samples
+    sample_status = pre_export_foot_samples.get("status") if isinstance(pre_export_foot_samples, dict) else None
+    sample_reason = pre_export_foot_samples.get("reason") if isinstance(pre_export_foot_samples, dict) else None
+    if sample_status != "success" and sample_reason:
+        reason_code = f"pre_export_foot_sampling/{sample_reason}"
+        reasons = list(annotated.get("reasons", [])) if isinstance(annotated.get("reasons"), list) else []
+        if not any(isinstance(reason, dict) and reason.get("code") == reason_code for reason in reasons):
+            reasons.append({"code": reason_code})
+        annotated["reasons"] = reasons
+        warnings = list(annotated.get("warnings", [])) if isinstance(annotated.get("warnings"), list) else []
+        warnings.append(reason_code)
+        annotated["warnings"] = _unique_list([str(warning) for warning in warnings])
+    return annotated
+
+
+def _safe_apply_root_axis_correction_to_translations(
+    axis_diagnostics: dict[str, object],
+    translations: list[tuple[float, float, float]] | tuple[tuple[float, float, float], ...],
+) -> tuple[dict[str, object], list[tuple[float, float, float]]]:
+    diagnostics = dict(axis_diagnostics)
+    original_translations = [tuple(float(component) for component in sample) for sample in translations]
+    try:
+        decision = plan_root_axis_correction(
+            axis_diagnostics=diagnostics,
+            locomotion_classification=str(diagnostics.get("classification") or "unknown"),
+        )
+        correction = decision
+        corrected_translations = original_translations
+        if decision.get("eligible") and decision.get("correction_status") == "eligible":
+            application = apply_root_axis_correction(root_positions=original_translations, decision=decision)
+            correction = {**decision, **application}
+            corrected_translations = [tuple(float(component) for component in sample) for sample in application.get("corrected_root_positions", original_translations)]
+        diagnostics["correction"] = _normalize_root_axis_correction_diagnostics(correction)
+        diagnostics["correction_eligible"] = bool(decision.get("eligible"))
+        return diagnostics, corrected_translations
+    except Exception as exc:  # noqa: BLE001 - correction planning must never block retargeting
+        correction = {
+            "correction_status": "skipped",
+            "status": "skipped",
+            "eligible": False,
+            "applied": False,
+            "applied_channels": [],
+            "skipped_reason": "correction/not_evaluated",
+            "reason": "correction/not_evaluated",
+            "confidence": 0.0,
+            "before": {"root_axis": None, "contract_forward": None},
+            "after": {"root_axis": None, "contract_forward": None},
+            "before_axis": None,
+            "after_axis": None,
+            "reasons": [{"code": "correction/not_evaluated", "detail": f"{type(exc).__name__}: {exc}"}],
+        }
+        diagnostics["correction"] = correction
+        diagnostics["correction_eligible"] = False
+        reasons = list(diagnostics.get("reasons", [])) if isinstance(diagnostics.get("reasons"), list) else []
+        reasons.append({"code": "correction/not_evaluated", "detail": f"{type(exc).__name__}: {exc}"})
+        diagnostics["reasons"] = reasons
+        return diagnostics, original_translations
+
+
+def _normalize_root_axis_correction_diagnostics(correction: dict[str, object]) -> dict[str, object]:
+    normalized = dict(correction)
+    evidence = normalized.get("evidence")
+    if isinstance(evidence, dict) and evidence.get("schema") == "kimodo.locomotion_axis.diagnostics.v1":
+        root_advance = evidence.get("root_advance") if isinstance(evidence.get("root_advance"), dict) else {}
+        contract_forward = evidence.get("contract_forward") if isinstance(evidence.get("contract_forward"), dict) else {}
+        normalized["evidence"] = {
+            "schema": evidence.get("schema"),
+            "classification": evidence.get("classification"),
+            "root_advance_axis": root_advance.get("signed_axis"),
+            "contract_forward_axis": contract_forward.get("signed_axis"),
+        }
+    status = str(normalized.get("correction_status") or normalized.get("status") or "skipped")
+    if status == "eligible" and normalized.get("applied"):
+        status = "applied"
+    normalized["correction_status"] = status
+    normalized["status"] = status
+    if "skipped_reason" not in normalized:
+        normalized["skipped_reason"] = normalized.get("reason") if status == "skipped" else None
+    if "reason" not in normalized or normalized.get("reason") is None:
+        normalized["reason"] = normalized.get("skipped_reason") if status == "skipped" else "correction/recognized_sideways_locomotion"
+    before = normalized.get("before") if isinstance(normalized.get("before"), dict) else {}
+    after = normalized.get("after") if isinstance(normalized.get("after"), dict) else {}
+    normalized["before"] = before
+    normalized["after"] = after
+    normalized["before_axis"] = normalized.get("before_axis") or before.get("root_axis") or normalized.get("source_axis")
+    normalized["after_axis"] = normalized.get("after_axis") or after.get("root_axis") or normalized.get("target_axis")
+    normalized.setdefault("applied_channels", [])
+    normalized.setdefault("recommended_channels", [])
+    normalized.setdefault("confidence", 0.0)
+    return normalized
+
+
+def _locomotion_axis_contract_basis(target: RigInspection) -> dict[str, object] | None:
+    hints = getattr(target, "humanoid_basis_hints", None)
+    if not isinstance(hints, dict) or not hints:
+        return None
+    forward = _first_locomotion_basis_value(hints, ("forward", "forward_axis", "forwardAxis"))
+    up = _first_locomotion_basis_value(hints, ("up", "up_axis", "upAxis"))
+    handedness = _first_locomotion_basis_value(hints, ("handedness", "handedness_axis", "coordinate_handedness"))
+    if forward is None and up is None and handedness is None:
+        return None
+    status = "trusted" if getattr(target, "contract_status", "contract_missing_or_untrusted") == "trusted" else "inferred"
+    basis = {"status": status}
+    if forward is not None:
+        basis["forward"] = forward
+    if up is not None:
+        basis["up"] = up
+    if handedness is not None:
+        basis["handedness"] = handedness
+    return basis
+
+
+def _first_locomotion_basis_value(values: dict[str, object], keys: tuple[str, ...]) -> object | None:
+    for key in keys:
+        if key in values:
+            return values[key]
+    for section_key in ("basis", "axes", "coordinate_system"):
+        section = values.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return section[key]
+    return None
+
+
+def _locomotion_axis_missing_stream(stream: str, code: str) -> dict[str, object]:
+    return {
+        "status": "missing_evidence",
+        "axis": None,
+        "dominance": "none",
+        "signed_axis": None,
+        "vector": [0.0, 0.0, 0.0],
+        "confidence": 0.0,
+        "reasons": [{"code": code}],
+        "stream": stream,
+    }
 
 
 def _angular_velocity_checks(clip: RetargetClip) -> list[dict[str, object]]:

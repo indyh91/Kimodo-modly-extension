@@ -3,6 +3,7 @@ import math
 import struct
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 from pathlib import Path
 
@@ -723,6 +724,380 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(policy["foot_contact_shape"], [2, 6])
         self.assertIn("contact_aware_foot_locking", policy["deferred"])
 
+    def test_retarget_clip_emits_locomotion_axis_diagnostics_without_correcting_root_motion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y", "handedness": "right"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_full_contract_bvh(bvh_path)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            rig = replace(rig, contract_status="contract_missing_or_untrusted")
+            context = MotionContext(
+                path=None,
+                root_positions=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                foot_contacts=((1.0, 0.0), (0.0, 1.0)),
+                source_keys=("root_positions", "foot_contacts"),
+            )
+
+        expected_root_deltas = context.root_deltas(frame_count=len(motion.frames))
+        clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        translation = next(channel for channel in clip.channels if channel.target_joint == "contract_hips" and channel.path == "translation")
+        self.assertEqual(clip.root_translations, expected_root_deltas)
+        self.assertEqual(translation.values, expected_root_deltas)
+        diagnostics = clip.calibration["locomotion_axis_alignment"]
+        self.assertEqual(diagnostics["schema"], "kimodo.locomotion_axis.diagnostics.v1")
+        self.assertEqual(diagnostics["contract_forward"]["signed_axis"], "+Z")
+        self.assertEqual(diagnostics["contract_up"]["signed_axis"], "+Y")
+        self.assertEqual(diagnostics["handedness"], "right")
+        self.assertEqual(diagnostics["root_advance"]["signed_axis"], "+X")
+        self.assertEqual(diagnostics["root_advance"]["dot_to_forward"], 0.0)
+        self.assertEqual(diagnostics["root_advance"]["angle_to_forward"], 90.0)
+        self.assertEqual(diagnostics["hips_facing"]["status"], "missing_evidence")
+        self.assertEqual(diagnostics["swing_plane"]["status"], "missing_evidence")
+        self.assertEqual(diagnostics["classification"], "lateral_locomotion")
+        self.assertFalse(diagnostics["correction_eligible"])
+        self.assertEqual(diagnostics["correction"]["status"], "skipped")
+        self.assertEqual(diagnostics["correction"]["applied_channels"], [])
+        self.assertEqual(diagnostics["correction"]["reason"], "basis/inferred_not_authorized")
+        reason_codes = {reason["code"] for reason in diagnostics["reasons"]}
+        self.assertIn("locomotion/lateral_root_advance", reason_codes)
+        self.assertIn("evidence/missing_facing", reason_codes)
+        warning_codes = {warning["code"] for warning in diagnostics["warnings"]}
+        self.assertIn("locomotion/axis_mismatch", warning_codes)
+        self.assertEqual(clip.visual_quality["checks"]["locomotion_axis_alignment"], diagnostics)
+
+    def test_retarget_clip_emits_non_blocking_ambiguous_locomotion_axis_diagnostics_for_insufficient_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_full_contract_bvh(bvh_path)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(path=None, root_positions=((0.0, 0.0, 0.0),), source_keys=("root_positions",))
+
+        clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        self.assertEqual(clip.root_translations[-1], (1.0, 0.0, 0.0))
+        diagnostics = clip.calibration["locomotion_axis_alignment"]
+        self.assertEqual(diagnostics["status"], "ok")
+        self.assertEqual(diagnostics["classification"], "ambiguous_locomotion")
+        self.assertFalse(diagnostics["correction_eligible"])
+        self.assertEqual(diagnostics["root_advance"]["status"], "missing_evidence")
+        self.assertEqual(diagnostics["hips_facing"]["status"], "missing_evidence")
+        self.assertEqual(diagnostics["swing_plane"]["status"], "missing_evidence")
+        reason_codes = {reason["code"] for reason in diagnostics["reasons"]}
+        self.assertIn("evidence/missing_root_positions", reason_codes)
+        self.assertIn("evidence/missing_facing", reason_codes)
+        self.assertIn("evidence/missing_swing_plane", reason_codes)
+        self.assertNotIn("locomotion_axis_alignment_blocking", clip.warnings)
+
+    def test_retarget_clip_applies_root_axis_correction_only_for_strong_trusted_lateral_locomotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y", "handedness": "right"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_full_contract_bvh(bvh_path, left_upper_arm_x_degrees=30.0)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(
+                path=None,
+                root_positions=((0.0, 3.0, 0.0), (1.4, 3.5, 0.0)),
+                source_keys=("root_positions",),
+            )
+
+        uncorrected = context.root_deltas(frame_count=len(motion.frames))
+        clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        translation = next(channel for channel in clip.channels if channel.target_joint == "contract_hips" and channel.path == "translation")
+        self.assertEqual(uncorrected, ((0.0, 0.0, 0.0), (1.4, 0.0, 0.0)))
+        self.assertEqual(clip.root_translations, ((0.0, 0.0, 0.0), (0.0, 0.0, 1.4)))
+        self.assertEqual(translation.values, clip.root_translations)
+        self.assertEqual(translation.times, (0.0, motion.frame_time))
+        root_rotation = next(channel for channel in clip.channels if channel.target_joint == "contract_hips" and channel.path == "rotation")
+        arm_rotation = next(channel for channel in clip.channels if channel.target_joint == "contract_left_upper_arm" and channel.path == "rotation")
+        self.assertEqual(root_rotation.values, ((0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, 1.0)))
+        self.assertTupleAlmostEqual(arm_rotation.values[1], (0.258819045102521, 0.0, 0.0, 0.965925826289068))
+
+        diagnostics = clip.calibration["locomotion_axis_alignment"]
+        self.assertEqual(diagnostics["classification"], "lateral_locomotion")
+        correction = diagnostics["correction"]
+        self.assertEqual(correction["correction_status"], "applied")
+        self.assertEqual(correction["status"], "applied")
+        self.assertEqual(correction["reason"], "correction/recognized_sideways_locomotion")
+        self.assertEqual(correction["before_axis"], "+X")
+        self.assertEqual(correction["after_axis"], "+Z")
+        self.assertEqual(correction["before"]["root_axis"], "+X")
+        self.assertEqual(correction["after"]["root_axis"], "+Z")
+        self.assertGreaterEqual(correction["confidence"], 0.85)
+        self.assertEqual(correction["applied_channels"], ["root_translation"])
+
+    def test_retarget_clip_skips_root_axis_correction_for_untrusted_ambiguous_or_non_lateral_cases(self):
+        cases = (
+            {
+                "name": "inferred_basis",
+                "contract_status": "contract_missing_or_untrusted",
+                "basis_hints": {"forward_axis": "Z", "up_axis": "Y"},
+                "root_positions": ((0.0, 0.0, 0.0), (1.4, 0.0, 0.0)),
+                "expected_classification": "lateral_locomotion",
+                "expected_reason": "basis/inferred_not_authorized",
+                "expected_translation": ((0.0, 0.0, 0.0), (1.4, 0.0, 0.0)),
+            },
+            {
+                "name": "ambiguous_low_confidence",
+                "contract_status": "trusted",
+                "basis_hints": {"forward_axis": "Z", "up_axis": "Y"},
+                "root_positions": ((0.0, 0.0, 0.0), (0.7, 0.0, 0.7)),
+                "expected_classification": "ambiguous_locomotion",
+                "expected_reason": "evidence/low_confidence_or_ambiguous",
+                "expected_translation": ((0.0, 0.0, 0.0), (0.7, 0.0, 0.7)),
+            },
+            {
+                "name": "forward_not_lateral",
+                "contract_status": "trusted",
+                "basis_hints": {"forward_axis": "Z", "up_axis": "Y"},
+                "root_positions": ((0.0, 0.0, 0.0), (0.0, 0.0, 1.4)),
+                "expected_classification": "forward_locomotion",
+                "expected_reason": "classification/not_lateral_locomotion",
+                "expected_translation": ((0.0, 0.0, 0.0), (0.0, 0.0, 1.4)),
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["name"]), tempfile.TemporaryDirectory() as tmp:
+                rig_path = Path(tmp) / "contract_avatar.gltf"
+                bvh_path = Path(tmp) / "contract_motion.bvh"
+                self._write_contract_rig(rig_path)
+                self._write_contract_sidecar(rig_path, basis=True)
+                payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+                payload["humanoid_contract"]["basis_hints"] = case["basis_hints"]
+                if case["contract_status"] != "trusted":
+                    payload["humanoid_contract"].pop("quality", None)
+                rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+                self._write_full_contract_bvh(bvh_path)
+                motion = parse_bvh(bvh_path)
+                rig = inspect_rig(rig_path)
+                if case["contract_status"] != "trusted":
+                    rig = replace(rig, contract_status=case["contract_status"])
+                self.assertEqual(rig.contract_status, case["contract_status"])
+                context = MotionContext(path=None, root_positions=case["root_positions"], source_keys=("root_positions",))
+
+                clip = build_retarget_clip(motion, rig, motion_context=context)
+
+                translation = next(channel for channel in clip.channels if channel.path == "translation")
+                diagnostics = clip.calibration["locomotion_axis_alignment"]
+                correction = diagnostics["correction"]
+                self.assertEqual(diagnostics["classification"], case["expected_classification"])
+                self.assertEqual(clip.root_translations, case["expected_translation"])
+                self.assertEqual(translation.values, case["expected_translation"])
+                self.assertEqual(correction["correction_status"], "skipped")
+                self.assertEqual(correction["status"], "skipped")
+                self.assertEqual(correction["reason"], case["expected_reason"])
+                self.assertEqual(correction["applied_channels"], [])
+                self.assertIn("before", correction)
+                self.assertIn("after", correction)
+                self.assertIn("confidence", correction)
+
+    def test_retarget_clip_skips_root_axis_correction_when_diagnostics_classify_dynamic_motion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_full_contract_bvh(bvh_path)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(path=None, root_positions=((0.0, 0.0, 0.0), (1.4, 0.0, 0.0)), source_keys=("root_positions",))
+
+        dynamic_diagnostics = {
+            "schema": "kimodo.locomotion_axis.diagnostics.v1",
+            "status": "ok",
+            "contract_forward": {"axis": "z", "signed_axis": "+Z", "vector": [0.0, 0.0, 1.0], "status": "trusted"},
+            "contract_up": {"axis": "y", "signed_axis": "+Y", "vector": [0.0, 1.0, 0.0], "status": "trusted"},
+            "handedness": None,
+            "root_advance": {"status": "misaligned", "dominance": "x", "signed_axis": "+X", "confidence": 1.0},
+            "hips_facing": {"status": "missing_evidence", "dominance": "none", "signed_axis": None, "confidence": 0.0},
+            "swing_plane": {"status": "missing_evidence", "dominance": "none", "signed_axis": None, "confidence": 0.0},
+            "classification": "dynamic",
+            "reasons": [],
+            "warnings": [],
+        }
+        with mock.patch("retargeting.diagnose_locomotion_axes", return_value=dynamic_diagnostics):
+            clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        translation = next(channel for channel in clip.channels if channel.path == "translation")
+        correction = clip.calibration["locomotion_axis_alignment"]["correction"]
+        self.assertEqual(clip.root_translations, ((0.0, 0.0, 0.0), (1.4, 0.0, 0.0)))
+        self.assertEqual(translation.values, clip.root_translations)
+        self.assertEqual(correction["correction_status"], "skipped")
+        self.assertEqual(correction["reason"], "classification/not_lateral_locomotion")
+        self.assertEqual(correction["applied_channels"], [])
+
+    def test_retarget_clip_attaches_limb_swing_plane_after_pre_export_foot_sampling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y", "handedness": "right"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_motion_quality_contract_bvh(bvh_path, root_x_positions=(0.0, 0.0, 0.0))
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(
+                path=None,
+                root_positions=((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, 2.0)),
+                source_keys=("root_positions",),
+            )
+        pre_export_foot_samples = {
+            "status": "success",
+            "reason": None,
+            "frame_count": 3,
+            "frame_time": 0.0333333,
+            "samples": {
+                "left": ((-0.3, -2.5, 0.2), (-0.2, -2.5, 1.3), (-0.1, -2.5, 2.4)),
+                "right": ((0.3, -2.5, 0.2), (0.2, -2.5, 1.3), (0.1, -2.5, 2.4)),
+            },
+            "bindings": {"left": "left_foot", "right": "right_foot"},
+            "source": "test_pre_export_sampler",
+            "warnings": [],
+        }
+        expected_diagnostics = {
+            "schema": "kimodo.limb_swing_plane.diagnostics.v1",
+            "status": "evaluated",
+            "classification": "healthy_limb_swing",
+            "risk": "healthy_limb_swing",
+            "sample_count": 3,
+            "correction_eligibility": {"eligible": False, "reasons": ["roles/missing_feet_or_toes"]},
+            "correction": {"status": "skipped", "applied": False, "applied_channels": []},
+        }
+
+        with mock.patch("retargeting.sample_pre_export_foot_nodes", return_value=pre_export_foot_samples) as sampler, mock.patch(
+            "retargeting.diagnose_limb_swing_plane",
+            return_value=expected_diagnostics,
+        ) as diagnose:
+            clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        sampler.assert_called_once()
+        diagnose.assert_called_once()
+        diagnose_kwargs = diagnose.call_args.kwargs
+        self.assertEqual(diagnose_kwargs["left_foot_positions"], pre_export_foot_samples["samples"]["left"])
+        self.assertEqual(diagnose_kwargs["right_foot_positions"], pre_export_foot_samples["samples"]["right"])
+        self.assertEqual(diagnose_kwargs["hips_positions"], clip.root_translations)
+        self.assertEqual(diagnose_kwargs["root_positions"], context.root_samples)
+        diagnostics = clip.calibration["limb_swing_plane"]
+        self.assertEqual(diagnostics["schema"], "kimodo.limb_swing_plane.diagnostics.v1")
+        self.assertEqual(diagnostics["diagnostic_source"], "pre_export_foot_samples")
+        self.assertEqual(diagnostics["pre_export_foot_samples"], pre_export_foot_samples)
+        self.assertEqual(diagnostics["status"], "evaluated")
+        self.assertEqual(clip.calibration["pre_export_foot_samples"], pre_export_foot_samples)
+
+    def test_retarget_clip_records_limb_swing_plane_risk_without_selecting_root_axis_correction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y", "handedness": "right"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_motion_quality_contract_bvh(bvh_path, root_x_positions=(0.0, 0.0, 0.0))
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+            context = MotionContext(
+                path=None,
+                root_positions=((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, 2.0)),
+                source_keys=("root_positions",),
+            )
+        pre_export_foot_samples = {
+            "status": "success",
+            "reason": None,
+            "frame_count": 3,
+            "frame_time": 0.0333333,
+            "samples": {
+                "left": ((-0.5, -2.5, 0.0), (0.4, -2.5, 1.1), (-1.0, -2.5, 2.2)),
+                "right": ((0.5, -2.5, 0.0), (-0.4, -2.5, 1.1), (1.0, -2.5, 2.2)),
+            },
+            "bindings": {"left": "left_foot", "right": "right_foot"},
+            "source": "test_pre_export_sampler",
+            "warnings": [],
+        }
+
+        with mock.patch("retargeting.sample_pre_export_foot_nodes", return_value=pre_export_foot_samples):
+            clip = build_retarget_clip(motion, rig, motion_context=context)
+
+        diagnostics = clip.calibration["limb_swing_plane"]
+        self.assertEqual(diagnostics["schema"], "kimodo.limb_swing_plane.diagnostics.v1")
+        self.assertEqual(diagnostics["status"], "evaluated")
+        self.assertEqual(diagnostics["risk"], "lateral_dominated_limb_swing")
+        self.assertTrue(diagnostics["root_hips_axis"]["aligned"])
+        self.assertEqual(diagnostics["root_hips_axis"]["signed_axis"], "+Z")
+        self.assertGreaterEqual(diagnostics["feet"]["left"]["lateral_forward_ratio"], 2.0)
+        self.assertGreaterEqual(diagnostics["feet"]["right"]["lateral_forward_ratio"], 2.0)
+        self.assertTrue(diagnostics["feet"]["left"]["midline_crossing"]["detected"])
+        self.assertTrue(diagnostics["feet"]["right"]["midline_crossing"]["detected"])
+        self.assertIn("roles/missing_feet_or_toes", diagnostics["correction_eligibility"]["reasons"])
+        axis_correction = clip.calibration["locomotion_axis_alignment"]["correction"]
+        self.assertEqual(clip.calibration["locomotion_axis_alignment"]["classification"], "forward_locomotion")
+        self.assertEqual(axis_correction["correction_status"], "skipped")
+        self.assertEqual(axis_correction["reason"], "classification/not_lateral_locomotion")
+        self.assertEqual(axis_correction["applied_channels"], [])
+
+    def test_retarget_clip_limb_swing_plane_fails_closed_when_pre_export_samples_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rig_path = Path(tmp) / "contract_avatar.gltf"
+            bvh_path = Path(tmp) / "contract_motion.bvh"
+            self._write_contract_rig(rig_path)
+            self._write_contract_sidecar(rig_path, basis=True)
+            payload = json.loads(rig_path.with_suffix(".rigmeta.json").read_text(encoding="utf-8"))
+            payload["humanoid_contract"]["basis_hints"] = {"forward_axis": "Z", "up_axis": "Y"}
+            rig_path.with_suffix(".rigmeta.json").write_text(json.dumps(payload), encoding="utf-8")
+            self._write_full_contract_bvh(bvh_path)
+            motion = parse_bvh(bvh_path)
+            rig = inspect_rig(rig_path)
+        pre_export_foot_samples = {
+            "status": "not_evaluated",
+            "reason": "missing_valid_leg_chains",
+            "frame_count": 2,
+            "frame_time": None,
+            "samples": {},
+            "bindings": {},
+            "source": "retarget_clip_trs",
+            "warnings": [],
+        }
+
+        with mock.patch("retargeting.sample_pre_export_foot_nodes", return_value=pre_export_foot_samples):
+            clip = build_retarget_clip(motion, rig)
+
+        diagnostics = clip.calibration["limb_swing_plane"]
+        self.assertEqual(diagnostics["schema"], "kimodo.limb_swing_plane.diagnostics.v1")
+        self.assertEqual(diagnostics["status"], "not_evaluated")
+        self.assertEqual(diagnostics["diagnostic_source"], "pre_export_foot_samples")
+        self.assertEqual(diagnostics["pre_export_foot_samples"], pre_export_foot_samples)
+        reason_codes = {reason["code"] for reason in diagnostics["reasons"]}
+        self.assertIn("samples/insufficient", reason_codes)
+        self.assertIn("pre_export_foot_sampling/missing_valid_leg_chains", reason_codes)
+        self.assertFalse(diagnostics["correction_eligibility"]["eligible"])
+        self.assertIn("samples/insufficient", diagnostics["correction_eligibility"]["reasons"])
+
     def test_invalid_motion_context_keeps_hips_suppressed_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             bvh_path = Path(tmp) / "static_root_hips_motion.bvh"
@@ -1264,6 +1639,213 @@ class RetargetingFoundationTests(unittest.TestCase):
         self.assertEqual(diagnostics["motion_quality_filter"], "role_aware_conservative")
         self.assertEqual(top_level["motion_quality_filter"], "role_aware_conservative")
         self.assertGreater(len(diagnostics["channels"]), 0)
+
+    def test_locomotion_axis_diagnostics_survive_success_metadata_additively(self):
+        axis_diagnostics = {
+            "schema": "kimodo.locomotion_axis.diagnostics.v1",
+            "status": "ok",
+            "contract_forward": {"signed_axis": "+Z", "vector": [0.0, 0.0, 1.0], "status": "trusted"},
+            "root_advance": {"signed_axis": "+X", "dot_to_forward": 0.0, "angle_degrees": 90.0, "confidence": 0.94, "reasons": []},
+            "hips_facing": {"signed_axis": "+X", "confidence": 0.8, "reasons": []},
+            "swing_plane": {"dominance": "x", "signed_axis": "+X", "confidence": 0.76, "reasons": []},
+            "classification": "lateral_locomotion",
+            "correction": {
+                "status": "applied",
+                "correction_status": "applied",
+                "reason": "correction/recognized_sideways_locomotion",
+                "before_axis": "+X",
+                "after_axis": "+Z",
+                "before": {"root_axis": "+X", "contract_forward": "+Z", "angle_degrees": 90.0, "dot": 0.0},
+                "after": {"root_axis": "+Z", "contract_forward": "+Z"},
+                "confidence": 0.86,
+                "applied_channels": ["root_translation"],
+            },
+            "warnings": [{"code": "locomotion_axis/axis_mismatch"}],
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=1.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=("existing_warning",),
+            calibration={"locomotion_axis_alignment": axis_diagnostics, "version": "kimodo.retarget_calibration.v1"},
+        )
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=object(), clip=clip, warnings=clip.warnings)
+
+        locomotion_axis = metadata["diagnostics"]["locomotion_axis"]
+        self.assertEqual(metadata["retarget_status"], "success")
+        self.assertEqual(metadata["warnings"], ["existing_warning"])
+        self.assertEqual(metadata["diagnostics"]["retarget_calibration"]["locomotion_axis_alignment"], axis_diagnostics)
+        self.assertEqual(metadata["retarget_calibration"]["locomotion_axis_alignment"], axis_diagnostics)
+        self.assertEqual(locomotion_axis["classification"], "lateral_locomotion")
+        self.assertEqual(locomotion_axis["contract_forward"]["signed_axis"], "+Z")
+        self.assertEqual(locomotion_axis["root_advance"]["signed_axis"], "+X")
+        self.assertEqual(locomotion_axis["hips_facing"]["signed_axis"], "+X")
+        self.assertEqual(locomotion_axis["swing_plane"]["dominance"], "x")
+        self.assertEqual(locomotion_axis["correction"]["correction_status"], "applied")
+        self.assertEqual(locomotion_axis["correction"]["reason"], "correction/recognized_sideways_locomotion")
+        self.assertEqual(locomotion_axis["correction"]["before_axis"], "+X")
+        self.assertEqual(locomotion_axis["correction"]["after_axis"], "+Z")
+        self.assertAlmostEqual(locomotion_axis["correction"]["confidence"], 0.86)
+
+    def test_locomotion_axis_metadata_preserves_semantic_candidate_trust_semantics(self):
+        axis_diagnostics = {
+            "schema": "kimodo.locomotion_axis.diagnostics.v1",
+            "status": "ok",
+            "contract_forward": {"signed_axis": "+Z", "status": "inferred", "source": "contract_basis.forward"},
+            "root_advance": {"signed_axis": "+X", "confidence": 0.72},
+            "hips_facing": {"status": "missing_evidence", "confidence": 0.0},
+            "swing_plane": {"dominance": "x", "confidence": 0.63},
+            "classification": "ambiguous_locomotion",
+            "correction": {
+                "status": "skipped",
+                "correction_status": "skipped",
+                "reason": "basis/inferred_not_authorized",
+                "skipped_reason": "basis/inferred_not_authorized",
+                "before_axis": "+X",
+                "after_axis": "+Z",
+                "confidence": 0.55,
+                "applied_channels": [],
+            },
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=1.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="semantic_candidate", pairs={}, warnings=("semantic_candidate_mapping",)),
+            warnings=(),
+            calibration={"locomotion_axis_alignment": axis_diagnostics},
+        )
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=object(), clip=clip, warnings=clip.warnings)
+
+        self.assertEqual(metadata["animation_mapping_status"], "semantic_candidate")
+        self.assertNotIn("retarget_calibration", metadata["diagnostics"])
+        self.assertIsNone(metadata["retarget_calibration"])
+        self.assertEqual(metadata["diagnostics"]["locomotion_axis"]["contract_forward"]["status"], "inferred")
+        self.assertEqual(metadata["diagnostics"]["locomotion_axis"]["correction"]["correction_status"], "skipped")
+        self.assertEqual(metadata["diagnostics"]["locomotion_axis"]["correction"]["skipped_reason"], "basis/inferred_not_authorized")
+
+    def test_limb_swing_plane_diagnostics_survive_success_metadata_as_bounded_json_safe_summary(self):
+        limb_diagnostics = {
+            "schema": "kimodo.limb_swing_plane.diagnostics.v1",
+            "status": "evaluated",
+            "classification": "lateral_dominated_limb_swing",
+            "risk": "lateral_dominated_limb_swing",
+            "diagnostic_source": "pre_export_foot_samples",
+            "sample_count": 4,
+            "root_hips_axis": {"aligned": True, "signed_axis": "+Z", "forward_range": 3.0, "lateral_drift_ratio": 0.02, "delta": [0.0, 0.0, 3.0]},
+            "feet": {
+                "left": {"sample_count": 4, "lateral_range": 2.4, "forward_range": 0.7, "lateral_forward_ratio": 3.42, "wrong_side_fraction": 0.25, "midline_crossing": {"detected": True, "count": 1, "frame_range": [1, 2]}},
+                "right": {"sample_count": 4, "lateral_range": 2.2, "forward_range": 0.8, "lateral_forward_ratio": 2.75, "wrong_side_fraction": 0.0, "midline_crossing": {"detected": False, "count": 0, "frame_range": None}},
+            },
+            "basis": {"source": "contract", "status": "asserted", "trusted_for_correction": True},
+            "mirror_validation": {"status": "passed", "evidence": {"left_chain_roles": ["left_upper_leg", "left_lower_leg", "left_foot"], "right_chain_roles": ["right_upper_leg", "right_lower_leg", "right_foot"], "rest_side_signs": {"left": -1, "right": 1}}},
+            "chain_validation": {"status": "passed", "evidence": {"ordered": True, "feet_present": True, "toes_present": True}},
+            "correction_eligibility": {"eligible": True, "policy": "trusted_basis_and_passing_chain_mirror_required", "reasons": []},
+            "correction": {
+                "schema": "kimodo.limb_swing_plane.correction_plan.v1",
+                "status": "eligible_not_applied",
+                "correction_status": "eligible_not_applied",
+                "eligible": True,
+                "applied": False,
+                "target_scope": "lower_body_rotation_channels",
+                "applied_channels": [],
+                "recommended_channels": ["left_upper_leg_rotation", "right_upper_leg_rotation"],
+                "reasons": [],
+            },
+            "thresholds": {"lateral_dominance_ratio_min": 2.0, "midline_wrong_side_fraction_min": 0.05},
+            "absolute_foot_motion_insufficient": True,
+            "confidence": 0.84,
+            "reasons": [{"code": "limb/lateral_dominated", "sides": ["left", "right"]}, {"code": "limb/midline_crossing_detected", "sides": ["left"]}],
+            "warnings": ["limb/lateral_dominated", "limb/midline_crossing_detected"],
+            "pre_export_foot_samples": {"status": "success", "samples": {"left": [(float(frame), 0.0, frame * 0.1) for frame in range(20)], "right": [(float(frame), 0.0, frame * 0.1) for frame in range(20)]}},
+            "runtime_object": object(),
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=1.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=("existing_warning",),
+            calibration={"version": "kimodo.retarget_calibration.v1", "limb_swing_plane": limb_diagnostics},
+        )
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=object(), clip=clip, warnings=clip.warnings)
+
+        limb = metadata["diagnostics"]["limb_swing_plane"]
+        self.assertEqual(limb["schema"], "kimodo.limb_swing_plane.diagnostics.v1")
+        self.assertEqual(limb["status"], "evaluated")
+        self.assertEqual(limb["risk"], "lateral_dominated_limb_swing")
+        self.assertEqual(limb["source"], "pre_export_foot_samples")
+        self.assertEqual(limb["root_advance_summary"]["signed_axis"], "+Z")
+        self.assertEqual(limb["per_foot_stats"]["left"]["lateral_forward_ratio"], 3.42)
+        self.assertEqual(limb["midline_crossing"]["left"]["detected"], True)
+        self.assertEqual(limb["validation_gates"]["basis"]["status"], "asserted")
+        self.assertEqual(limb["validation_gates"]["mirror"]["status"], "passed")
+        self.assertEqual(limb["validation_gates"]["chain"]["status"], "passed")
+        self.assertTrue(limb["correction_eligibility"]["eligible"])
+        self.assertFalse(limb["correction"]["applied"])
+        self.assertEqual(limb["correction"]["status"], "eligible_not_applied")
+        self.assertEqual(limb["correction"]["correction_status"], "eligible_not_applied")
+        self.assertEqual(limb["correction"]["target_scope"], "lower_body_rotation_channels")
+        self.assertEqual(limb["correction"]["recommended_channels"], ["left_upper_leg_rotation", "right_upper_leg_rotation"])
+        self.assertNotIn("samples", limb["pre_export_foot_samples"])
+        self.assertNotIn("runtime_object", limb)
+        self.assertEqual(metadata["diagnostics"]["retarget_calibration"]["limb_swing_plane"], limb)
+        json.dumps(metadata)
+
+    def test_not_evaluated_limb_swing_plane_metadata_remains_safe_and_non_blocking(self):
+        limb_diagnostics = {
+            "schema": "kimodo.limb_swing_plane.diagnostics.v1",
+            "status": "not_evaluated",
+            "classification": "not_evaluated",
+            "risk": "not_evaluated",
+            "diagnostic_source": "pre_export_foot_samples",
+            "sample_count": 0,
+            "feet": {},
+            "root_hips_axis": None,
+            "basis": {"source": None, "status": "missing", "trusted_for_correction": False, "reason": "basis/missing"},
+            "mirror_validation": {"status": "missing", "reasons": ["mirror/missing"], "evidence": {}},
+            "chain_validation": {"status": "missing", "reasons": ["chain/missing"], "evidence": {}},
+            "correction_eligibility": {"eligible": False, "policy": "trusted_basis_and_passing_chain_mirror_required", "reasons": ["samples/insufficient", "basis/missing"]},
+            "correction": {"status": "skipped", "correction_status": "skipped", "applied": False, "applied_channels": [], "reasons": ["samples/insufficient"]},
+            "reasons": [{"code": "samples/insufficient"}],
+            "warnings": ["samples/insufficient"],
+            "pre_export_foot_samples": {"status": "skipped", "reason": "missing_valid_leg_chains", "samples": {"left": [(0.0, 0.0, 0.0)]}},
+        }
+        clip = RetargetClip(
+            name="Kimodo Motion",
+            duration=1.0,
+            frame_time=1.0 / 30.0,
+            root_translations=(),
+            channels=(),
+            mapping=JointMapping(confidence="calibrated", pairs={}, warnings=()),
+            warnings=("existing_warning",),
+            calibration={"version": "kimodo.retarget_calibration.v1", "limb_swing_plane": limb_diagnostics},
+        )
+
+        metadata = retarget_success_metadata(Path("animated.glb"), rig=object(), clip=clip, warnings=clip.warnings)
+
+        limb = metadata["diagnostics"]["limb_swing_plane"]
+        self.assertEqual(metadata["warnings"], ["existing_warning"])
+        self.assertEqual(limb["status"], "not_evaluated")
+        self.assertEqual(limb["risk"], "not_evaluated")
+        self.assertEqual(limb["pre_export_foot_samples"], {"status": "skipped", "reason": "missing_valid_leg_chains"})
+        self.assertFalse(limb["correction_eligibility"]["eligible"])
+        self.assertIn("samples/insufficient", limb["correction_eligibility"]["reasons"])
+        self.assertFalse(limb["correction"]["applied"])
+        self.assertEqual(limb["correction"]["correction_status"], "skipped")
+        self.assertIn("samples/insufficient", limb["correction"]["reasons"])
+        self.assertNotIn("samples", limb["pre_export_foot_samples"])
+        json.dumps(metadata)
 
     def test_visual_quality_success_metadata_is_additive_non_blocking_and_namespaced(self):
         visual_quality = {

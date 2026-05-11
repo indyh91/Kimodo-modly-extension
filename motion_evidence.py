@@ -18,6 +18,8 @@ def classify_motion_evidence(
     dynamic_intensity: Any = None,
     trusted_leg_chains: bool = False,
     prompt_hint: str | None = None,
+    axis_diagnostics: Any = None,
+    limb_swing_plane_diagnostics: Any = None,
 ) -> dict[str, Any]:
     root = _vec3_series(root_samples)
     feet = _foot_series(foot_samples)
@@ -33,6 +35,12 @@ def classify_motion_evidence(
         "trusted_leg_chains": bool(trusted_leg_chains),
         "frame_count": frame_count,
     }
+    locomotion_axis = _axis_diagnostics_payload(axis_diagnostics)
+    if locomotion_axis is not None:
+        evidence["locomotion_axis"] = locomotion_axis
+    limb_swing_plane = _limb_swing_plane_payload(limb_swing_plane_diagnostics)
+    if limb_swing_plane is not None:
+        evidence["limb_swing_plane"] = limb_swing_plane
     if not trusted_leg_chains:
         return _result(
             "ineligible",
@@ -56,21 +64,31 @@ def classify_motion_evidence(
         reasons = ["high_dynamic_intensity"]
         if stance == "unstable":
             reasons.append("unstable_contact_windows")
-        return _with_prompt_conflict(_result("dynamic", 0.9, reasons, evidence, prompt), prompt)
+        return _with_prompt_conflict(_with_limb_swing_plane_risk(_result("dynamic", 0.9, reasons, evidence, prompt), limb_swing_plane), prompt)
+
+    axis_result = _axis_diagnostic_result(locomotion_axis, evidence, prompt)
+    if axis_result is not None:
+        return _with_prompt_conflict(_with_limb_swing_plane_risk(axis_result, limb_swing_plane), prompt)
 
     if root_displacement >= 0.35 and contact_pattern == "alternating" and foot_velocity_max >= 0.08:
         return _with_prompt_conflict(
-            _result("walking", 0.85, ["root_displacement_locomotive", "alternating_foot_contacts", "foot_velocity_locomotive"], evidence, prompt),
+            _with_limb_swing_plane_risk(
+                _result("walking", 0.85, ["root_displacement_locomotive", "alternating_foot_contacts", "foot_velocity_locomotive"], evidence, prompt),
+                limb_swing_plane,
+            ),
             prompt,
         )
 
     if root_displacement <= 0.12 and foot_velocity_max <= 0.05 and stance == "stable" and (dynamic is None or dynamic <= 0.25):
-        return _with_prompt_conflict(_result("gesture_like", 0.75, ["stable_root", "stable_feet", "low_dynamic_intensity"], evidence, prompt), prompt)
+        return _with_prompt_conflict(
+            _with_limb_swing_plane_risk(_result("gesture_like", 0.75, ["stable_root", "stable_feet", "low_dynamic_intensity"], evidence, prompt), limb_swing_plane),
+            prompt,
+        )
 
     if stance == "unstable" or foot_velocity_max >= 0.45:
-        return _with_prompt_conflict(_result("dynamic", 0.7, ["unstable_contact_windows"], evidence, prompt), prompt)
+        return _with_prompt_conflict(_with_limb_swing_plane_risk(_result("dynamic", 0.7, ["unstable_contact_windows"], evidence, prompt), limb_swing_plane), prompt)
 
-    return _with_prompt_conflict(_result("unknown", 0.2, ["ambiguous_motion_evidence"], evidence, prompt), prompt)
+    return _with_prompt_conflict(_with_limb_swing_plane_risk(_result("unknown", 0.2, ["ambiguous_motion_evidence"], evidence, prompt), limb_swing_plane), prompt)
 
 
 def _result(
@@ -91,6 +109,118 @@ def _result(
         "conflicts": [],
         "warnings": warnings or [],
     }
+
+
+def _axis_diagnostics_payload(axis_diagnostics: Any) -> dict[str, Any] | None:
+    if not isinstance(axis_diagnostics, dict):
+        return None
+    classification = axis_diagnostics.get("classification")
+    if not isinstance(classification, str):
+        return None
+    return axis_diagnostics
+
+
+def _limb_swing_plane_payload(limb_diagnostics: Any) -> dict[str, Any] | None:
+    if not isinstance(limb_diagnostics, dict):
+        return None
+    if limb_diagnostics.get("schema") != "kimodo.limb_swing_plane.diagnostics.v1":
+        return None
+    if limb_diagnostics.get("status") != "evaluated":
+        return None
+    risk = limb_diagnostics.get("risk") or limb_diagnostics.get("classification")
+    if not isinstance(risk, str) or risk in {"", "healthy_limb_swing", "unknown"}:
+        return None
+    return limb_diagnostics
+
+
+def _with_limb_swing_plane_risk(result: dict[str, Any], limb_diagnostics: dict[str, Any] | None) -> dict[str, Any]:
+    if limb_diagnostics is None:
+        return result
+    reasons = _dedupe_strings([*result.get("reasons", []), *_limb_reason_codes(limb_diagnostics)])
+    warnings = _dedupe_strings([*result.get("warnings", []), *_limb_warning_codes(limb_diagnostics)])
+    return {**result, "reasons": reasons, "warnings": warnings}
+
+
+def _limb_reason_codes(limb_diagnostics: dict[str, Any]) -> list[str]:
+    risk = limb_diagnostics.get("risk") or limb_diagnostics.get("classification")
+    codes = _reason_codes(limb_diagnostics.get("reasons"))
+    if isinstance(risk, str) and risk:
+        codes.insert(0, f"limb_swing_plane/{risk}")
+    return _dedupe_strings(codes)
+
+
+def _limb_warning_codes(limb_diagnostics: dict[str, Any]) -> list[str]:
+    codes = _reason_codes(limb_diagnostics.get("warnings"))
+    eligibility = limb_diagnostics.get("correction_eligibility")
+    if isinstance(eligibility, dict) and eligibility.get("eligible") is False:
+        codes.append("limb_swing_plane/correction_not_eligible")
+    return _dedupe_strings(codes)
+
+
+def _axis_diagnostic_result(axis_diagnostics: dict[str, Any] | None, evidence: dict[str, Any], prompt_hint: str | None) -> dict[str, Any] | None:
+    if axis_diagnostics is None:
+        return None
+
+    classification = axis_diagnostics.get("classification")
+    if classification == "forward_locomotion":
+        return _result(
+            "forward_locomotion",
+            0.85,
+            ["locomotion_axis/forward_aligned", *_axis_reason_codes(axis_diagnostics)],
+            evidence,
+            prompt_hint,
+            warnings=_axis_warning_codes(axis_diagnostics),
+        )
+    if classification == "lateral_locomotion":
+        return _result(
+            "lateral_locomotion",
+            0.8,
+            ["locomotion_axis/lateral_locomotion", *_axis_reason_codes(axis_diagnostics)],
+            evidence,
+            prompt_hint,
+            warnings=_dedupe_strings(["locomotion/axis_mismatch", *_axis_warning_codes(axis_diagnostics)]),
+        )
+    if classification == "ambiguous_locomotion":
+        return _result(
+            "ambiguous_locomotion",
+            0.45,
+            ["locomotion_axis/ambiguous_locomotion", *_axis_reason_codes(axis_diagnostics)],
+            evidence,
+            prompt_hint,
+            warnings=_dedupe_strings(["evidence/stream_disagreement", *_axis_warning_codes(axis_diagnostics)]),
+        )
+    return None
+
+
+def _axis_reason_codes(axis_diagnostics: dict[str, Any]) -> list[str]:
+    return _reason_codes(axis_diagnostics.get("reasons"))
+
+
+def _axis_warning_codes(axis_diagnostics: dict[str, Any]) -> list[str]:
+    return _reason_codes(axis_diagnostics.get("warnings"))
+
+
+def _reason_codes(values: Any) -> list[str]:
+    codes: list[str] = []
+    for value in values or ():
+        if isinstance(value, dict):
+            code = value.get("code")
+        else:
+            code = value
+        if isinstance(code, str) and code:
+            codes.append(code)
+    return _dedupe_strings(codes)
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def _with_prompt_conflict(result: dict[str, Any], prompt_hint: str | None) -> dict[str, Any]:
@@ -114,7 +244,7 @@ def _prompt_hint_class(prompt_hint: str | None) -> str | None:
 def _hint_matches(class_name: str, hint_class: str) -> bool:
     if class_name == hint_class:
         return True
-    if class_name == "locomotive" and hint_class == "walking":
+    if class_name in {"locomotive", "forward_locomotion"} and hint_class == "walking":
         return True
     return False
 
