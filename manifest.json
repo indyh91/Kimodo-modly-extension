@@ -138,6 +138,10 @@
       "type": "model",
       "input": "text",
       "inputs": [
+        "text",
+        "mesh"
+      ],
+      "input_contract": [
         {
           "name": "prompt",
           "label": "Prompt",

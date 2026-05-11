@@ -12,14 +12,20 @@ def read_manifest():
 
 
 class ManifestContractTests(unittest.TestCase):
-    def test_animate_rigged_mesh_multi_inputs_have_labels_for_renderer_fallbacks(self):
+    def test_animate_rigged_mesh_inputs_are_renderer_safe_strings(self):
         manifest = read_manifest()
         node = next(node for node in manifest["nodes"] if node["id"] == "animate-rigged-mesh")
 
         self.assertEqual(node["input"], "text")
         self.assertEqual(node["output"], "mesh")
+        self.assertEqual(node["inputs"], ["text", "mesh"])
+        self.assertTrue(all(isinstance(port, str) for port in node["inputs"]))
 
-        ports = {port["name"]: port for port in node["inputs"]}
+    def test_animate_rigged_mesh_preserves_named_input_contract(self):
+        manifest = read_manifest()
+        node = next(node for node in manifest["nodes"] if node["id"] == "animate-rigged-mesh")
+
+        ports = {port["name"]: port for port in node["input_contract"]}
         self.assertEqual(set(ports), {"prompt", "rigged_mesh"})
 
         self.assertEqual(ports["prompt"]["type"], "text")
