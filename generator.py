@@ -15,6 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Modly executes extension entrypoints via runpy/importlib, which may not put
+# this directory on sys.path. Make sibling modules importable without relying
+# on the caller's working directory or modifying any global Python settings.
+_EXTENSION_ROOT = Path(__file__).resolve().parent
+if str(_EXTENSION_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXTENSION_ROOT))
+
 from host_compat import EXPERIMENTAL, UNSUPPORTED, resolve_host_compatibility
 from glb_animation_exporter import GlbAnimationExporter
 from glb_world_space import extract_world_foot_samples
