@@ -365,21 +365,38 @@ def normalize_rigged_mesh_source_kind(params: dict[str, Any]) -> str:
 
 
 def normalize_node_id(params: dict[str, Any]) -> str:
-    raw_node_id = params.get("node_id") or params.get("model_node_id") or params.get("capability_id") or os.environ.get("MODEL_NODE_ID")
-    if isinstance(raw_node_id, str) and raw_node_id.strip():
-        value = raw_node_id.strip()
-        if value.endswith(f"/{ANIMATE_RIGGED_MESH_NODE_ID}") or value == ANIMATE_RIGGED_MESH_NODE_ID:
+    """Resolve Modly node identity across 0.4.1/0.4.2 and newer host contracts.
+
+    Older Modly versions pass MODEL_DIR with the selected node id as its final
+    component. Newer versions also pass MODEL_NODE_ID. A missing identity must
+    not silently turn an explicitly supplied rigged-mesh request into preview.
+    """
+    host_model_dir = os.environ.get("MODEL_DIR", "")
+    model_dir_node = Path(host_model_dir).name if host_model_dir.strip() else ""
+    candidates = (
+        os.environ.get("MODEL_NODE_ID"),
+        model_dir_node,
+        os.environ.get("MODEL_ID"),
+        params.get("node_id"),
+        params.get("model_node_id"),
+        params.get("capability_id"),
+        params.get("model_id"),
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        value = candidate.strip()
+        if value == ANIMATE_RIGGED_MESH_NODE_ID or value.endswith(f"/{ANIMATE_RIGGED_MESH_NODE_ID}"):
             return ANIMATE_RIGGED_MESH_NODE_ID
-        if value.endswith(f"/{PREVIEW_NODE_ID}") or value == PREVIEW_NODE_ID:
+        if value == PREVIEW_NODE_ID or value.endswith(f"/{PREVIEW_NODE_ID}"):
             return PREVIEW_NODE_ID
 
-    raw_model_id = params.get("model_id")
-    if isinstance(raw_model_id, str) and raw_model_id.strip():
-        if raw_model_id.strip().endswith(f"/{ANIMATE_RIGGED_MESH_NODE_ID}"):
+    for key in ("rigged_mesh_path", "mesh_path"):
+        mesh_path = params.get(key)
+        if isinstance(mesh_path, str) and mesh_path.strip():
             return ANIMATE_RIGGED_MESH_NODE_ID
 
     return PREVIEW_NODE_ID
-
 
 def resolve_constraints_path(raw: Any) -> Path | None:
     if raw in (None, ""):
