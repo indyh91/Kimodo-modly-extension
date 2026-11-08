@@ -365,7 +365,7 @@ def normalize_rigged_mesh_source_kind(params: dict[str, Any]) -> str:
 
 
 def normalize_node_id(params: dict[str, Any]) -> str:
-    raw_node_id = params.get("node_id") or params.get("model_node_id") or params.get("capability_id")
+    raw_node_id = params.get("node_id") or params.get("model_node_id") or params.get("capability_id") or os.environ.get("MODEL_NODE_ID")
     if isinstance(raw_node_id, str) and raw_node_id.strip():
         value = raw_node_id.strip()
         if value.endswith(f"/{ANIMATE_RIGGED_MESH_NODE_ID}") or value == ANIMATE_RIGGED_MESH_NODE_ID:
